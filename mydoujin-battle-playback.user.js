@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         我的同人｜戰報逐行播放
 // @namespace    mydoujin-battle-playback
-// @version      1.0.0
-// @description  Boss 挑戰、玩家切磋／茶渡、戰報頁回放：戰鬥過程一行一行出現，勝負、死亡標記與死亡橫幅等到最後一行才揭曉。可調每行間隔，或切回直接顯示結果
+// @version      1.1.0
+// @description  Boss 挑戰、玩家切磋／茶渡、戰報頁回放：戰鬥過程一行一行出現，勝負、死亡標記與死亡橫幅等到最後一行才揭曉。可調每行間隔，或切回直接顯示結果；每一行後面顯示被打／被補的人剩多少血
 // @match        https://mydoujin.online/*
 // @run-at       document-start
 // @grant        none
@@ -14,9 +14,10 @@
 
   /* 原理：遊戲把整場戰報一次畫好，這支腳本只是先把每一行藏起來、照間隔一行一行放出來，
      同時把「勝利／失敗／平手」「死亡」標籤、頂端「你的角色死亡了」橫幅、隊伍成員的存活狀態
-     暫時蓋住，播完才恢復。不改任何資料、不打任何 API。 */
+     暫時蓋住，播完才恢復。不改任何資料。
+     剩餘血量：從戰報資料逐行推算（受傷扣、回復加、倒下歸零），並用戰報最後的「剩餘 HP」校正。 */
   const CFG_KEY = 'mdp:cfg';
-  const DEF = { mode: 'step', sec: 0.6 };
+  const DEF = { mode: 'step', sec: 0.6, hp: true };
   const load = () => { try { return Object.assign({}, DEF, JSON.parse(localStorage.getItem(CFG_KEY)) || {}); } catch (e) { return Object.assign({}, DEF); } };
   const save = () => { try { localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); } catch (e) {} };
   let cfg = load();
@@ -69,12 +70,18 @@
   /* 戰鬥送出時就先蓋住結果：Boss 頁送出挑戰後，隊伍狀態可能比戰報視窗先更新 */
   const origFetch = window.fetch;
   window.fetch = function (input, init) {
+    const p = origFetch.apply(this, arguments);
     try {
       const url = typeof input === 'string' ? input : (input && input.url) || '';
       const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
-      if (method === 'POST' && (/\/api\/dungeon\/challenge(?:[?#]|$)/.test(url) || /\/api\/players\/[^/]+\/[^/?#]+(?:[?#]|$)/.test(url))) armGuard();
+      const battlePost = method === 'POST' && (/\/api\/dungeon\/challenge(?:[?#]|$)/.test(url) || /\/api\/players\/[^/]+\/[^/?#]+(?:[?#]|$)/.test(url));
+      if (battlePost) armGuard();
+      // 順手把遊戲自己拿到的戰報資料記下來，用來算每一行的剩餘血量（不另外打 API）
+      if (battlePost || (method === 'GET' && /\/api\/battle-reports\/\d+(?:[?#]|$)/.test(url))) {
+        p.then(res => { if (res && res.ok) res.clone().json().then(remember).catch(() => {}); }).catch(() => {});
+      }
     } catch (e) {}
-    return origFetch.apply(this, arguments);
+    return p;
   };
 
   /* ---------- 找戰鬥過程 ---------- */
@@ -92,7 +99,193 @@
     return out;
   }
   const rowsOf = box => [...box.children].filter(isRow);
-  const sigOf = box => { const r = rowsOf(box); return r.length + '|' + (r[0] ? r[0].children[1].textContent.slice(0, 40) : '') + '|' + (r.length ? r[r.length - 1].children[1].textContent.slice(0, 40) : ''); };
+  // 一行的戰報文字（不含這支腳本加上去的血量標籤）
+  const msgText = row => { let t = ''; row.children[1].childNodes.forEach(n => { if (!(n.nodeType === 1 && n.hasAttribute('data-mdp-hp'))) t += n.textContent; }); return t; };
+  const sigOf = box => { const r = rowsOf(box); return r.length + '|' + (r[0] ? msgText(r[0]).slice(0, 40) : '') + '|' + (r.length ? msgText(r[r.length - 1]).slice(0, 40) : ''); };
+
+
+  /* ---------- 剩餘血量 ---------- */
+  const API = 'https://mydoujin-backend.onrender.com';
+  const datasets = [];      // 最近拿到的戰報資料 { logs, participants, reportId }
+  function findBattle(d, depth) {
+    if (!d || typeof d !== 'object' || depth > 3) return null;
+    if (Array.isArray(d.logs) && d.logs.some(l => l && typeof l === 'object')) return d;
+    for (const k of Object.keys(d)) {
+      const v = d[k];
+      if (v && typeof v === 'object' && !Array.isArray(v)) { const r = findBattle(v, depth + 1); if (r) return r; }
+    }
+    return null;
+  }
+  function remember(d) {
+    const b = findBattle(d, 0);
+    if (!b) return;
+    const rid = b.reportId != null ? String(b.reportId) : null;
+    let ds = rid ? datasets.find(x => x.reportId === rid) : null;
+    if (ds) { ds.logs = b.logs; if (b.participants) ds.participants = b.participants; }
+    else {
+      datasets.unshift({ logs: b.logs, participants: b.participants || null, reportId: rid });
+      if (datasets.length > 6) datasets.pop();
+    }
+    schedule();
+  }
+  const shownLogs = logs => {
+    const idx = [];
+    logs.forEach((l, i) => { if (typeof l === 'string' || (l && (l.message ?? l.description) !== '')) idx.push(i); });
+    return idx;
+  };
+  const logText = l => typeof l === 'string' ? l : (l.message ?? l.description ?? JSON.stringify(l));
+
+  // 戰報資料要跟畫面上的行一一對得起來才用：行數一樣、頭中尾三行文字相同
+  function matchDataset(rows) {
+    const n = rows.length;
+    for (const ds of datasets) {
+      const idx = ds.idx || (ds.idx = shownLogs(ds.logs));
+      if (idx.length !== n) continue;
+      const ok = [0, n >> 1, n - 1].every(k => msgText(rows[k]).trim() === String(logText(ds.logs[idx[k]])).trim());
+      if (ok) return ds;
+    }
+    return null;
+  }
+
+  /* 推算方式（用 20 場實際戰報驗證過，最後剩餘 HP 全部對得上）：
+     - 起始血量＝滿血；造成傷害用 actualDamage（真正扣掉的血），反擊沒有 actualDamage 就用數值、扣到 0 為止
+     - 治療、持續回復、文字裡的「回復了 N HP」加血，不超過上限；「失去了 N HP」扣血
+     - 有戰報最後的「剩餘 HP」或「倒下了」就從結尾倒推回來校正。
+       愛國者這種殘血後重生的 BOSS，重生之後改用倒推的數字 */
+  function computeHp(ds) {
+    const logs = ds.logs, P = ds.participants || {};
+    const U = {};
+    const unit = id => id ? (U[id] || (U[id] = { id, name: null, max: null, ev: [], anchor: null })) : null;
+    (P.players || []).forEach(p => { const u = unit(p.userId || p.entityId || p._id); if (u) { u.name = p.characterName || p.name; u.max = Number(p.stats && p.stats.hp) || null; u.side = 'A'; } });
+    (P.enemies || []).forEach(p => { const u = unit(p.userId || p.entityId || p._id); if (u) { u.name = p.characterName || p.name; u.max = Number(p.stats && p.stats.hp) || null; u.side = 'B'; } });
+    const ev = (id, i, d, heal) => { const u = unit(id); if (u) u.ev.push({ i, d, heal: !!heal }); };
+    logs.forEach((l, i) => {
+      if (!l || typeof l !== 'object') return;
+      const v = Number(l.value) || 0, msg = String(l.message || '');
+      const real = l.actualDamage != null ? Number(l.actualDamage) || 0 : v;
+      switch (l.type) {
+        case 'DAMAGE': case 'BLOCK': ev(l.targetId, i, -real); break;
+        case 'COUNTER': {
+          if (l.value == null) break;
+          // 有些反擊後面還會再記一筆 isCounter 的 DAMAGE，那筆才算
+          let dup = false;
+          for (let j = i + 1; j < Math.min(logs.length, i + 6); j++) {
+            const x = logs[j];
+            if (x && (x.type === 'DAMAGE' || x.type === 'BLOCK') && x.isCounter && (Number(x.value) === v || x.actorId === l.actorId)) { dup = true; break; }
+          }
+          if (!dup) ev(l.targetId, i, -real);
+          break;
+        }
+        case 'LUCK_EVENT': ev(l.targetId, i, -v); break;
+        case 'MISS': ev(l.targetId, i, 0); break;
+        case 'BUFF_EFFECT':
+          if (!v) break;
+          if (l.buffType === 'HOT' || (/恢復|回復/.test(msg) && !/傷害|失去/.test(msg))) ev(l.actorId, i, v, true);
+          else ev(l.actorId, i, -v);
+          break;
+        case 'HEAL': ev(l.targetId || l.actorId, i, v, true); break;
+        case 'DEATH': {
+          const u = unit(l.actorId);
+          if (u) { u.anchor = { i, v: 0 }; if (!u.name) { const m = msg.match(/^(.+?)\s*倒下了/); if (m) u.name = m[1]; } }
+          ev(l.actorId, i, 0);
+          break;
+        }
+        case 'HP_REMAINING': {
+          const u = unit(l.actorId);
+          if (u) { u.anchor = { i, v }; if (l.maxHp) u.max = Number(l.maxHp); if (!u.name) { const m = msg.match(/^(.+?)\s*剩餘/); if (m) u.name = m[1]; } }
+          break;
+        }
+        default: {
+          if (!/TEXT|BUFF_APPLY/.test(String(l.type))) break;
+          const mh = msg.match(/(?:恢復|回復)了\s*(\d+)\s*(?:HP|點生命)/);
+          if (mh) ev(l.actorId, i, Number(mh[1]), true);
+          const ml = msg.match(/失去了\s*(\d+)\s*(?:HP|點生命)/);
+          if (ml) ev(l.actorId, i, -Number(ml[1]));
+        }
+      }
+    });
+    const out = {};   // 戰報第 i 筆 → [{ name, hp, max, side }]
+    Object.values(U).forEach(u => {
+      const E = u.ev.filter(e => !u.anchor || e.i <= u.anchor.i);
+      if (!E.length) return;
+      let F = null, B = null;
+      if (u.max) { F = []; let h = u.max; E.forEach(e => { h = e.heal ? Math.min(u.max, h + e.d) : Math.max(0, h + e.d); F.push(h); }); }
+      if (u.anchor) {
+        B = new Array(E.length);
+        let b = u.anchor.v;
+        for (let k = E.length - 1; k >= 0; k--) { B[k] = b; b -= E[k].d; if (u.max) b = Math.min(u.max, b); b = Math.max(0, b); }
+      }
+      let V;
+      if (!F) V = B;
+      else if (!B) V = F;
+      else if (Math.abs(F[F.length - 1] - u.anchor.v) <= 1) V = F;
+      else {
+        // 推算的結尾對不上：多半是殘血後重生。掉到 1 滴血之後、下一次真的扣血或補血之前照推算的，之後改用倒推的
+        let r = F.findIndex(x => x <= 1);
+        if (r >= 0) { while (r + 1 < E.length && E[r + 1].d === 0) r++; V = F.map((x, k) => k <= r ? x : B[k]); }
+        else V = B;
+      }
+      if (!V) return;
+      E.forEach((e, k) => { (out[e.i] = out[e.i] || []).push({ name: u.name || '？', hp: Math.round(V[k]), max: u.max, side: u.side }); });
+    });
+    return out;
+  }
+
+  const fmt = n => Number(n).toLocaleString('en-US');
+  const hpColor = (hp, max) => { if (!max) return '#a0aec0'; const r = hp / max; return r > 0.5 ? '#68d391' : r > 0.25 ? '#f6e05e' : '#fc8181'; };
+  function chipEl(list) {
+    const wrap = document.createElement('span');
+    wrap.setAttribute('data-mdp-hp', '');
+    wrap.style.cssText = 'display:inline-flex;flex-wrap:wrap;gap:4px 10px;margin-left:8px;vertical-align:middle;font-size:11px;line-height:1.6;font-family:inherit;white-space:nowrap;';
+    list.forEach(x => {
+      const c = document.createElement('span');
+      c.style.cssText = 'display:inline-flex;align-items:center;gap:4px;padding:0 6px;border-radius:4px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);';
+      const col = hpColor(x.hp, x.max);
+      const pct = x.max ? Math.max(0, Math.min(100, x.hp / x.max * 100)) : 0;
+      c.innerHTML = '<span style="color:#cbd5e0"></span>' +
+        (x.max ? '<span style="display:inline-block;width:38px;height:5px;border-radius:3px;background:rgba(255,255,255,.15);overflow:hidden"><span style="display:block;height:100%;width:' + pct.toFixed(1) + '%;background:' + col + '"></span></span>' : '') +
+        '<span style="color:' + col + ';font-weight:700"></span>' + (x.max ? '<span style="color:#718096"></span>' : '');
+      c.children[0].textContent = x.name;
+      const val = c.children[x.max ? 2 : 1];
+      val.textContent = x.hp <= 0 ? '0' : fmt(x.hp);
+      if (x.max) c.children[3].textContent = '/' + fmt(x.max);
+      c.title = x.name + ' 剩餘 ' + fmt(x.hp) + (x.max ? ' / ' + fmt(x.max) + ' HP' : ' HP');
+      wrap.appendChild(c);
+    });
+    return wrap;
+  }
+  const clearChips = box => { box.querySelectorAll('[data-mdp-hp]').forEach(e => e.remove()); };
+
+  const hpState = new WeakMap();   // box → { sig, ds, withP }
+  function requestReport(ds) {
+    if (!ds.reportId || ds.fetching || ds.failed) return;
+    let token = null;
+    try { token = localStorage.getItem('token'); } catch (e) {}
+    if (!token) { ds.failed = true; return; }
+    ds.fetching = true;
+    // 挑戰／切磋的回傳沒有角色血量上限時，讀一次這場的戰報補上（跟戰報頁讀的是同一份）
+    origFetch.call(window, API + '/api/battle-reports/' + ds.reportId, { headers: { Authorization: 'Bearer ' + token } })
+      .then(r => r.json())
+      .then(j => { if (j && j.participants) ds.participants = j.participants; else ds.failed = true; })
+      .catch(() => { ds.failed = true; })
+      .finally(() => { ds.fetching = false; schedule(); });
+  }
+  function ensureHp(box) {
+    if (!cfg.hp) { if (hpState.has(box)) { clearChips(box); hpState.delete(box); } return; }
+    const rows = rowsOf(box);
+    if (!rows.length) return;
+    const sig = sigOf(box);
+    const st = hpState.get(box);
+    // 已經畫好、而且沒有新的血量上限資料進來 → 不用重畫
+    if (st && st.sig === sig && (st.withP || !st.ds.participants)) return;
+    const ds = matchDataset(rows);
+    if (!ds) return;            // 資料還沒到，下一輪再試
+    const res = computeHp(ds);
+    clearChips(box);
+    rows.forEach((row, k) => { const list = res[ds.idx[k]]; if (list && list.length) row.children[1].appendChild(chipEl(list)); });
+    hpState.set(box, { sig, ds, withP: !!ds.participants });
+    if (!ds.participants) requestReport(ds);
+  }
 
   /* ---------- 播放 ---------- */
   let cur = null;            // { box, rows, idx, playing, timer, bar, sig }
@@ -196,7 +389,9 @@
       const s = sigOf(cur.box);
       if (s !== cur.sig) startPlayback(cur.box);      // 同一個視窗換成另一場
     }
-    findLogBoxes().forEach(box => {
+    const boxes = findLogBoxes();
+    boxes.forEach(box => { try { ensureHp(box); } catch (e) {} });
+    boxes.forEach(box => {
       if (cur && cur.box === box) return;
       const s = sigOf(box);
       if (seen.get(box) === s) return;
@@ -239,6 +434,7 @@
           <button data-a="mode" data-v="instant" class="${step ? '' : 'on'}">直接顯示結果</button></div>
         <div class="row${step ? '' : ' off'}"><label>每行間隔</label><input id="sec" type="number" min="0.05" max="10" step="0.1" value="${cfg.sec}"${step ? '' : ' disabled'}><span>秒</span></div>
         <div class="row${step ? '' : ' off'}"><input id="follow" type="checkbox"${cfg.follow !== false ? ' checked' : ''}${step ? '' : ' disabled'}><label for="follow">自動捲到最新一行</label></div>
+        <div class="row"><input id="hp" type="checkbox"${cfg.hp !== false ? ' checked' : ''}><label for="hp">每一行顯示被打／被補的人剩餘血量</label></div>
         <div class="hint">播放時「勝利／失敗」「死亡」標籤、頂端死亡橫幅、隊伍成員存活狀態都會先蓋住，最後一行出現才揭曉。</div>
       </div>` : '');
     if (popOpen) placePop(sr);
@@ -276,6 +472,7 @@
       const t = e.target;
       if (t.id === 'sec') { cfg.sec = clampSec(t.value); t.value = cfg.sec; save(); updateBar(); }
       if (t.id === 'follow') { cfg.follow = t.checked; save(); }
+      if (t.id === 'hp') { cfg.hp = t.checked; save(); findLogBoxes().forEach(b => { hpState.delete(b); if (!cfg.hp) clearChips(b); }); schedule(); }
     });
     renderSettings(sr);
     return host;
@@ -324,11 +521,12 @@
 
   /* ---------- 啟動：DOM 一變就檢查（在畫面畫出來之前就把行藏好） ---------- */
   let scheduled = false;
-  const mo = new MutationObserver(() => {
+  function schedule() {
     if (scheduled) return;
     scheduled = true;
     queueMicrotask(() => { scheduled = false; try { scan(); } catch (e) {} });
-  });
+  }
+  const mo = new MutationObserver(schedule);
   function start() {
     mo.observe(document.documentElement, { childList: true, subtree: true });
     setInterval(() => { try { scan(); } catch (e) {} }, 500);
