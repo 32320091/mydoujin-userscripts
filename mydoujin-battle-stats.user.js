@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報統計面板
 // @namespace    mydoujin-battle-stats
-// @version      1.9.0
+// @version      1.10.0
 // @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷；並自動累積逐筆傷害樣本與 BOSS 圖鑑（數值＋使用過的技能），可匯出 CSV
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -93,7 +93,8 @@
       mlevel: p.level != null ? p.level : null,
       dealt: { real: 0, shown: 0 },
       taken: { real: 0, shown: 0 },
-      byKind: { normal: { real: 0, shown: 0, n: 0 }, skill: { real: 0, shown: 0, n: 0 }, counter: { real: 0, shown: 0, n: 0 }, dot: { real: 0, shown: 0, n: 0 }, passive: { real: 0, shown: 0, n: 0 } },
+      byKind: { normal: { real: 0, shown: 0, n: 0 }, skill: { real: 0, shown: 0, n: 0 }, counter: { real: 0, shown: 0, n: 0 }, dot: { real: 0, shown: 0, n: 0 }, passive: { real: 0, shown: 0, n: 0 }, fart: { real: 0, shown: 0, n: 0 } },
+      simmer: null,   // 西米（死靈廚師）專屬：番茄湯、臭臭茶放屁、回收桶
       luck: 0, luckN: 0, luckTaken: 0, luckTakenN: 0,
       heal: 0, healRecv: 0, sp: 0, spRecv: 0,
       crit: 0, hitN: 0, blockedN: 0, maxHit: 0, missN: 0, dodgeN: 0,
@@ -211,6 +212,18 @@
       return null;
     };
 
+    /* 西米（simmer）：
+       - 番茄湯：上菜時立即回 智力×0.9（HEAL，skillId simmer_cook），之後每跳 智力×0.15（BUFF_EFFECT，buffId simmer_dish_tomato_soup，
+         actorId 是喝湯的人）。持續回復算回西米身上，西米倒下後還在跳的也算，另外標出來。
+       - 臭臭茶：喝過的隊友被打時「憋不住放了一個屁」反打攻擊者（DAMAGE，source SIMMER_FART，actorId 是西米），傷害看西米智力。
+       - 回收桶（被動 simmer_recycle_bin）：有出現就逐筆記下來。 */
+    const simOf = u => u.simmer || (u.simmer = { soupNow: 0, soupNowN: 0, soupTick: 0, soupTickN: 0, soupAfterDeath: 0, soupBy: {}, fart: 0, fartN: 0, fartBy: {}, bin: [] });
+    const lastDish = {};          // 隊友 id → 最後端給他的料理名稱
+    const soupOwner = {};         // 喝湯的人 id → 端湯的西米
+    let simmerUnit = null;
+    const isRecycle = l => /recycle/i.test(String(l.passiveId || '') + String(l.skillId || '') + String(l.buffId || '') + String(l.source || '')) ||
+      (/回收桶/.test(String(l.message || '')) && !(l.skillId === 'simmer_cook' && /[「」]/.test(String(l.message || ''))));
+
     // 只有普攻／技能／反擊會判定爆擊；異常狀態與反傷不會，不能算進爆擊率分母
     const CRITABLE = { normal: 1, skill: 1, counter: 1 };
     const hit = (a, t, real, shown, kind, l) => {
@@ -229,6 +242,15 @@
       const a = get(l.actorId), t = get(l.targetId);
       const v = num(l.value);
       if (a && l.skillId) { const pre = String(l.skillId).split('_')[0]; if (!IGNORE_PREFIX[pre] && !prefixOwner[pre]) prefixOwner[pre] = a; }
+      if (a && l.skillId === 'simmer_cook') {
+        simmerUnit = simmerUnit || a;
+        const md = String(l.message || '').match(/把一盤\s*(.+?)\s*推到/);
+        if (md && t) { lastDish[t.id] = md[1]; if (/番茄湯/.test(md[1])) soupOwner[t.id] = a; }
+      }
+      if (isRecycle(l)) {
+        const owner = (a && a.simmer) || (a && l.passiveId === 'simmer_recycle_bin' && a) ? a : simmerUnit;
+        if (owner) { const sm = simOf(owner); if (sm.bin.length < 40) sm.bin.push({ who: (t || a || {}).name || '', type: l.type, v, msg: String(l.message || '') }); }
+      }
       switch (l.type) {
         case 'SKILL_TEXT': {
           const mz = String(l.message || '').match(/([^\s，。！」]+?)(?:散去了|消散了)/);
@@ -245,6 +267,17 @@
           // actorId = 被影響的人（例如「桐人 在毒雲瘴壁中衰變，失去了 278 點生命」）
           const msg = String(l.message || '');
           if (!a || !v) break;
+          if (l.buffId === 'simmer_dish_tomato_soup' || (/番茄湯/.test(msg) && /恢復|回復/.test(msg))) {
+            a.healRecv += v;
+            const cook = soupOwner[a.id] || simmerUnit;
+            if (cook) {
+              cook.heal += v;
+              const sm = simOf(cook); sm.soupTick += v; sm.soupTickN++;
+              if (cook.dead) sm.soupAfterDeath += v;
+              const b = (sm.soupBy[a.name] = sm.soupBy[a.name] || { now: 0, tick: 0, n: 0 }); b.tick += v; b.n++;
+            }
+            break;
+          }
           if (/恢復|回復/.test(msg) && !/傷害|失去/.test(msg)) { a.healRecv += v; break; }
           const name = dotName(l, msg);
           const src = dotSource(l, name, a);
@@ -262,6 +295,16 @@
         case 'DAMAGE':
         case 'BLOCK': {
           const real = l.actualDamage != null ? num(l.actualDamage) : v;
+          if (l.source === 'SIMMER_FART' || l.passiveId === 'simmer_fart') {
+            hit(a, t, real, v, 'fart', l);
+            if (a) {
+              const sm = simOf(a); sm.fart += real; sm.fartN++;
+              const me = String(l.message || '').match(/^\s*(.+?)\s*挨了這一下/);
+              const who = me ? me[1] : '？';
+              const b = (sm.fartBy[who] = sm.fartBy[who] || { dmg: 0, n: 0 }); b.dmg += real; b.n++;
+            }
+            break;
+          }
           const st = statusDamage(l, String(l.message || ''));
           if (st) {
             hit(a, t, real, v, st.kind, l);
@@ -326,6 +369,10 @@
           }
           if (a) a.heal += v;
           if (t) t.healRecv += v;
+          if (a && t && l.skillId === 'simmer_cook' && /番茄湯/.test(lastDish[t.id] || '')) {
+            const sm = simOf(a); sm.soupNow += v; sm.soupNowN++;
+            const b = (sm.soupBy[t.name] = sm.soupBy[t.name] || { now: 0, tick: 0, n: 0 }); b.now += v;
+          }
           break;
         }
         case 'SP_RECOVER':
@@ -593,6 +640,9 @@
   .tag.dot { color: #9ae6b4; border-color: #68d391; }
   .tag.pas { color: #90cdf4; border-color: #63b3ed; }
   .tag.sum { color: #d6bcfa; border-color: #b794f4; }
+  .tag.soup { color: #feb2b2; border-color: #fc8181; }
+  .tag.fart { color: #c6f6d5; border-color: #48bb78; background: rgba(72,187,120,.12); }
+  .spl .ad { color: #feb2b2; }
   .spl .dotl b { color: #9ae6b4; }
   .spl .rst b { color: #7bd5a6; }
   .spl { margin-top: 9px; padding-top: 7px; border-top: 1px dashed rgba(255,255,255,.12); font-size: 13px; }
@@ -663,6 +713,9 @@
       (u.specialN ? `<span class="tag spx">特殊迴避 ×${u.specialN}</span>` : '') +
       (u.byKind.dot.n ? `<span class="tag dot">異常狀態 ${fmt(u.byKind.dot.real)}</span>` : '') +
       (u.byKind.passive.n ? `<span class="tag pas">反傷 ${fmt(u.byKind.passive.real)}</span>` : '') +
+      (u.simmer && (u.simmer.soupNow + u.simmer.soupTick) ? `<span class="tag soup">番茄湯 +${fmt(u.simmer.soupNow + u.simmer.soupTick)}</span>` : '') +
+      (u.simmer && u.simmer.fartN ? `<span class="tag fart">放屁 ${fmt(u.simmer.fart)}</span>` : '') +
+      (u.simmer && u.simmer.bin.length ? `<span class="tag soup">回收桶 ×${u.simmer.bin.length}</span>` : '') +
       (u.isSummon ? '<span class="tag sum">分身</span>' : '') +
       (u.summonN ? `<span class="tag sum">召喚 ×${u.summonN}</span>` : '');
     const hp = u.hpLeft != null ? `剩餘 HP ${fmt(u.hpLeft)}${u.hpMax ? ' / ' + fmt(u.hpMax) : ''}` : '';
@@ -692,6 +745,7 @@
         ${item('反擊傷害', fmt(k.counter[mode]) + '（' + k.counter.n + ' 下）')}
         ${k.dot.n ? item('異常狀態傷害', fmt(k.dot[mode]) + '（' + k.dot.n + ' 次）') : ''}
         ${k.passive.n ? item('反傷', fmt(k.passive[mode]) + '（' + k.passive.n + ' 次）') : ''}
+        ${k.fart.n ? item('臭臭茶放屁', fmt(k.fart[mode]) + '（' + k.fart.n + ' 次）', 'fart') : ''}
         ${item('爆擊率', critPct(u.crit, u.hitN) + '（' + u.crit + ' / ' + u.hitN + ' 次判定）')}
         ${u.luk != null ? item('幸運值', u.luk + (u.isSummon ? '（沿用本體，公式推估 ' : '（公式推估 ') + critTheory(u.luk) + '）') : ''}
         ${u.isSummon && u.ownerName ? item('本體', u.ownerName + (u.summonSkill ? '（' + u.summonSkill + '）' : ''), 'sum') : ''}
@@ -707,7 +761,7 @@
         ${item('被幸運砸中', u.luckTakenN + ' 次／' + fmt(u.luckTaken))}
         ${item('受到治療', fmt(u.healRecv))}
         ${item('獲得 SP', fmt(u.spRecv))}
-      </div>${dotList(u.dot, '異常狀態／持續傷害（這個角色造成的）')}${dotList(u.dotTaken, '受到的異常狀態／持續傷害')}${dotList(u.passiveDot, '反傷（這個角色造成的）')}${dotList(u.passiveTaken, '受到的反傷')}${specialList(u)}</td></tr>`;
+      </div>${dotList(u.dot, '異常狀態／持續傷害（這個角色造成的）')}${dotList(u.dotTaken, '受到的異常狀態／持續傷害')}${dotList(u.passiveDot, '反傷（這個角色造成的）')}${dotList(u.passiveTaken, '受到的反傷')}${simmerList(u)}${specialList(u)}</td></tr>`;
     }
     return html;
   }
@@ -724,6 +778,29 @@
     }).join('');
     const sum = ent.length > 1 || totR ? `<div class="dotl">・合計<b>${fmt(totD)}</b>${totR ? `，扣掉回復後淨傷害<b>${fmt(totD - totR)}</b>` : ''}</div>` : '';
     return `<div class="spl"><span class="k">${esc(title)}</span>${rows}${sum}</div>`;
+  }
+
+  /* 西米專屬：番茄湯（立即＋持續，逐位隊友）、臭臭茶放屁（逐位喝茶的隊友）、回收桶 */
+  function simmerList(u) {
+    const s = u.simmer;
+    if (!s) return '';
+    let h = '';
+    const soup = s.soupNow + s.soupTick;
+    if (soup) {
+      h += `<div class="dotl">・番茄湯總回復<b>${fmt(soup)}</b>（立即 ${fmt(s.soupNow)}／${s.soupNowN} 碗，持續 ${fmt(s.soupTick)}／${s.soupTickN} 跳${s.soupAfterDeath ? `，其中西米倒下後還跳了 <b class="ad">${fmt(s.soupAfterDeath)}</b>` : ''}）</div>`;
+      h += Object.entries(s.soupBy).sort((a, b) => (b[1].now + b[1].tick) - (a[1].now + a[1].tick))
+        .map(([n, b]) => `<div class="rst">　${esc(n)}<b>${fmt(b.now + b.tick)}</b>（立即 ${fmt(b.now)}＋持續 ${fmt(b.tick)}／${b.n} 跳）</div>`).join('');
+    }
+    if (s.fartN) {
+      h += `<div class="dotl">・臭臭茶放屁傷害<b>${fmt(s.fart)}</b>（${s.fartN} 次，每次約 ${fmt(s.fart / s.fartN)}；傷害看西米的智力）</div>`;
+      h += Object.entries(s.fartBy).sort((a, b) => b[1].dmg - a[1].dmg)
+        .map(([n, b]) => `<div class="rst">　${esc(n)} 放的<b>${fmt(b.dmg)}</b>（${b.n} 次）</div>`).join('');
+    }
+    if (s.bin.length) {
+      h += `<div class="dotl">・回收桶<b>${s.bin.length} 次</b></div>` +
+        s.bin.map(x => `<div class="rst">　${esc(x.msg.length > 60 ? x.msg.slice(0, 60) + '…' : x.msg)}${x.v ? `<b>${fmt(x.v)}</b>` : ''}</div>`).join('');
+    }
+    return h ? `<div class="spl"><span class="k">西米料理（番茄湯／臭臭茶／回收桶）</span>${h}</div>` : '';
   }
 
   function specialList(u) {
