@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報統計面板
 // @namespace    mydoujin-battle-stats
-// @version      1.10.0
+// @version      1.13.0
 // @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷；並自動累積逐筆傷害樣本與 BOSS 圖鑑（數值＋使用過的技能），可匯出 CSV
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -19,8 +19,8 @@
   let currentId = null;
   let host = null, root = null;
   let statusText = '';
-  const state = {
-    mode: load('mode', 'real'),        // real = 實際扣血（不含溢出）, shown = 戰報文字上的數字
+  const state = { menu: false,
+    mode: 'shown',                     // 固定用戰報文字上的數字（已移除「實際扣血」切換）
     collapsed: load('collapsed', false),
     hidden: false,
     pos: load('pos', null),
@@ -216,13 +216,12 @@
        - 番茄湯：上菜時立即回 智力×0.9（HEAL，skillId simmer_cook），之後每跳 智力×0.15（BUFF_EFFECT，buffId simmer_dish_tomato_soup，
          actorId 是喝湯的人）。持續回復算回西米身上，西米倒下後還在跳的也算，另外標出來。
        - 臭臭茶：喝過的隊友被打時「憋不住放了一個屁」反打攻擊者（DAMAGE，source SIMMER_FART，actorId 是西米），傷害看西米智力。
-       - 回收桶（被動 simmer_recycle_bin）：有出現就逐筆記下來。 */
-    const simOf = u => u.simmer || (u.simmer = { soupNow: 0, soupNowN: 0, soupTick: 0, soupTickN: 0, soupAfterDeath: 0, soupBy: {}, fart: 0, fartN: 0, fartBy: {}, bin: [] });
+       - 回收桶（被動 simmer_recycle_bin）：只算「X 被這一擊打進了回收桶」那一句（掀蓋子、台詞都不算），
+         接著那筆「從桶裡爬了出來…恢復了 N HP」（HEAL，skillId simmer_recycle_bin）記成這次救回的血。 */
+    const simOf = u => u.simmer || (u.simmer = { soupNow: 0, soupNowN: 0, soupTick: 0, soupTickN: 0, soupAfterDeath: 0, soupBy: {}, fart: 0, fartN: 0, fartBy: {}, bin: [], binHeal: 0 });
     const lastDish = {};          // 隊友 id → 最後端給他的料理名稱
     const soupOwner = {};         // 喝湯的人 id → 端湯的西米
     let simmerUnit = null;
-    const isRecycle = l => /recycle/i.test(String(l.passiveId || '') + String(l.skillId || '') + String(l.buffId || '') + String(l.source || '')) ||
-      (/回收桶/.test(String(l.message || '')) && !(l.skillId === 'simmer_cook' && /[「」]/.test(String(l.message || ''))));
 
     // 只有普攻／技能／反擊會判定爆擊；異常狀態與反傷不會，不能算進爆擊率分母
     const CRITABLE = { normal: 1, skill: 1, counter: 1 };
@@ -247,9 +246,19 @@
         const md = String(l.message || '').match(/把一盤\s*(.+?)\s*推到/);
         if (md && t) { lastDish[t.id] = md[1]; if (/番茄湯/.test(md[1])) soupOwner[t.id] = a; }
       }
-      if (isRecycle(l)) {
-        const owner = (a && a.simmer) || (a && l.passiveId === 'simmer_recycle_bin' && a) ? a : simmerUnit;
-        if (owner) { const sm = simOf(owner); if (sm.bin.length < 40) sm.bin.push({ who: (t || a || {}).name || '', type: l.type, v, msg: String(l.message || '') }); }
+      if (a && l.skillId === 'simmer_recycle_bin') {
+        const sm = simOf(a);
+        const msg = String(l.message || '');
+        const mw = msg.match(/^\s*(.+?)\s*(?:被這一擊打進|從桶裡爬)/);
+        const who = t ? t.name : (mw ? mw[1] : '');
+        if (/打進了?回收桶/.test(msg)) sm.bin.push({ who, heal: null });
+        else if (l.type === 'HEAL') {
+          sm.binHeal += v;
+          const open = [...sm.bin].reverse().filter(x => x.heal == null);
+          const last = open.find(x => x.who === who) || open.find(x => !x.who || !who);
+          if (last && !last.who) last.who = who;
+          if (last) last.heal = v; else sm.bin.push({ who, heal: v });
+        }
       }
       switch (l.type) {
         case 'SKILL_TEXT': {
@@ -604,35 +613,44 @@
   const CSS = `
   :host { all: initial; }
   * { box-sizing: border-box; }
-  .panel { position: fixed; z-index: 2147483000; width: 920px; max-width: calc(100vw - 32px); max-height: calc(100vh - 24px);
-    display: flex; flex-direction: column; background: #1a202c; color: rgba(255,255,255,.88); border: 1px solid #4a5568;
-    box-shadow: 0 8px 28px rgba(0,0,0,.45); font: 14px/1.5 "Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; }
-  .hd { display: flex; align-items: center; gap: 8px; padding: 9px 12px; background: #171923; border-bottom: 1px solid #4a5568; cursor: move; user-select: none; }
-  .ttl { font-weight: 700; color: #fff; white-space: nowrap; }
-  .sub { color: #a0aec0; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
-  .tools { display: flex; gap: 4px; flex-shrink: 0; }
-  button { font: inherit; font-size: 13px; color: #e2e8f0; background: #2d3748; border: 1px solid #4a5568; padding: 3px 10px; cursor: pointer; }
-  button:hover { background: #4a5568; }
+  .panel { position: fixed; z-index: 2147483000; width: 940px; max-width: calc(100vw - 32px); max-height: calc(100vh - 24px);
+    display: flex; flex-direction: column; background: #171c27; color: rgba(255,255,255,.88); border: 1px solid #3a4558; border-radius: 12px;
+    box-shadow: 0 14px 40px rgba(0,0,0,.55); font: 14px/1.5 "Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; overflow: hidden; }
+  .hd { display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: linear-gradient(180deg,#1f2636,#191f2c);
+    border-bottom: 1px solid #2d3748; cursor: move; user-select: none; }
+  .ttlw { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 10px; }
+  .ttl { font-weight: 700; color: #fff; white-space: nowrap; letter-spacing: .5px; }
+  .sub { color: #8b98ad; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .tools { display: flex; gap: 4px; flex-shrink: 0; align-items: center; }
+  button { font: inherit; font-size: 12px; color: #e2e8f0; background: #263042; border: 1px solid #3a4558; border-radius: 6px; padding: 4px 10px; cursor: pointer; white-space: nowrap; }
+  button:hover { background: #33405a; }
   button.on { border-color: #4FD1C5; color: #4FD1C5; }
-  .bd { overflow: auto; padding: 10px 12px 12px; }
-  .side { margin-bottom: 12px; }
-  .side-hd { display: flex; justify-content: space-between; align-items: baseline; font-weight: 700; color: #e2c897; margin: 2px 0 4px; }
-  .side-hd span { font-weight: 400; color: #a0aec0; font-size: 13px; }
-  table { width: 100%; border-collapse: collapse; }
-  th, td { padding: 7px 8px; border-bottom: 1px solid rgba(255,255,255,.07); white-space: nowrap; }
-  th { font-size: 13px; font-weight: 600; color: #a0aec0; text-align: right; background: #2d3748; }
+  button.ib { width: 30px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 15px; line-height: 1; }
+  .panel.col { width: auto; min-width: 240px; }
+  .panel.col .hd { border-bottom: none; }
+  .menu { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px; background: #121722; border-bottom: 1px solid #2d3748; }
+  .menu button { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; padding: 6px 12px; }
+  .menu button em { font-style: normal; color: #4FD1C5; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .menu button.warn { color: #f6878b; border-color: rgba(246,135,139,.45); margin-left: auto; }
+  .menu button.warn:hover { background: rgba(246,135,139,.12); }
+  .bd { overflow: auto; padding: 10px 12px 14px; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+  .side { margin-bottom: 14px; }
+  .side-hd { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-weight: 700; color: #e2c897; margin: 2px 2px 6px; }
+  .side-hd span { font-weight: 400; color: #8b98ad; font-size: 12px; text-align: right; }
+  table { width: 100%; border-collapse: separate; border-spacing: 0; border: 1px solid #2d3748; border-radius: 8px; overflow: hidden; }
+  th, td { padding: 7px 9px; border-bottom: 1px solid rgba(255,255,255,.06); white-space: nowrap; }
+  th { font-size: 12px; font-weight: 600; color: #8b98ad; text-align: right; background: #1f2636; position: sticky; top: 0; }
   th:first-child, td:first-child { text-align: left; }
   td { text-align: right; font-variant-numeric: tabular-nums; }
   tr.u { cursor: pointer; }
-  tr.u:hover td { background: rgba(255,255,255,.04); }
+  tr.u:hover td, tr.u.open td { background: rgba(79,209,197,.05); }
+  .arw { color: #4FD1C5; font-size: 11px; margin-right: 5px; }
   .nm { color: #fff; font-weight: 600; min-width: 200px; }
-  .nm small { display: block; font-weight: 400; color: #a0aec0; font-size: 12px; }
+  .nm small { display: block; font-weight: 400; color: #8b98ad; font-size: 12px; margin-left: 16px; }
   tr.u.hasbst > td { border-bottom: none; padding-bottom: 2px; }
   tr.bst { cursor: pointer; }
-  tr.bst:hover td { background: rgba(255,255,255,.04); }
-  tr.bst td { padding: 0 8px 7px 8px; text-align: left; white-space: normal; font-weight: 400;
-    color: #a0aec0; font-size: 12px; letter-spacing: .2px; }
-  .tag { display: inline-block; font-size: 11px; padding: 0 5px; margin-left: 4px; border: 1px solid; vertical-align: 1px; font-weight: 400; }
+  tr.bst td { padding: 0 9px 7px 25px; text-align: left; white-space: normal; font-weight: 400; color: #8b98ad; font-size: 12px; }
+  .tag { display: inline-block; font-size: 11px; padding: 0 6px; margin-left: 4px; border: 1px solid; border-radius: 999px; vertical-align: 1px; font-weight: 400; line-height: 1.6; }
   .tag.dead { color: #f6878b; border-color: #f6878b; }
   .tag.ast { color: #90cdf4; border-color: #90cdf4; }
   .tag.burn { color: #f6ad55; border-color: #f6ad55; }
@@ -646,7 +664,7 @@
   .spl .dotl b { color: #9ae6b4; }
   .spl .rst b { color: #7bd5a6; }
   .spl { margin-top: 9px; padding-top: 7px; border-top: 1px dashed rgba(255,255,255,.12); font-size: 13px; }
-  .spl .k { color: #a0aec0; }
+  .spl .k { color: #8b98ad; }
   .spl div { color: #cbd5e0; margin-top: 2px; }
   .spl b { color: #fff; font-variant-numeric: tabular-nums; margin-left: 6px; }
   .grid .burn b { color: #f6ad55; }
@@ -655,21 +673,56 @@
   .c-take { color: #f6878b; } .c-heal { color: #7bd5a6; } .c-sp { color: #90cdf4; }
   .c-crit { color: #f6e05e; font-variant-numeric: tabular-nums; }
   .zero { color: rgba(255,255,255,.25) !important; font-weight: 400 !important; }
-  .bar { height: 3px; background: rgba(79,209,197,.15); margin-top: 3px; }
-  .bar i { display: block; height: 100%; background: #4FD1C5; }
-  .pct { font-size: 11px; color: #a0aec0; font-weight: 400; }
-  tr.sum td { border-top: 1px solid #4a5568; font-weight: 700; background: rgba(255,255,255,.03); }
-  tr.det td { background: #2d3748; text-align: left; white-space: normal; padding: 8px 10px; }
+  .bar { height: 4px; border-radius: 2px; background: rgba(79,209,197,.13); margin-top: 3px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: linear-gradient(90deg,#2c7a7b,#4FD1C5); border-radius: 2px; }
+  .pct { font-size: 11px; color: #8b98ad; font-weight: 400; }
+  tr.sum td { border-top: 1px solid #3a4558; font-weight: 700; background: rgba(255,255,255,.03); }
+  tr.sum td:first-child { color: #e2e8f0; }
+  tr.det td { background: #1f2636; text-align: left; white-space: normal; padding: 10px 12px; }
   .grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 5px 18px; font-size: 13px; }
-  .grid b { color: #fff; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .grid .k { color: #a0aec0; }
-  .foot { font-size: 12px; color: #718096; line-height: 1.65; border-top: 1px solid rgba(255,255,255,.07); padding-top: 7px; }
-  .msg { padding: 16px 4px; color: #a0aec0; }
+  .grid > div { display: flex; justify-content: space-between; gap: 8px; border-bottom: 1px dotted rgba(255,255,255,.07); padding: 2px 0; }
+  .grid b { color: #fff; font-weight: 600; font-variant-numeric: tabular-nums; text-align: right; }
+  .grid .k { color: #8b98ad; }
+  .msg { padding: 16px 4px; color: #8b98ad; }
   .msg.err { color: #f6878b; }
-  .fab { position: fixed; z-index: 2147483000; right: 16px; bottom: 16px; padding: 6px 12px; background: #171923; color: #4FD1C5;
-    border: 1px solid #4FD1C5; font: 600 13px "Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
-  @media (max-width: 560px) { .grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+  .fab { position: fixed; z-index: 2147483000; right: 16px; bottom: 16px; padding: 8px 14px; background: #171c27; color: #4FD1C5;
+    border: 1px solid #4FD1C5; border-radius: 999px; font: 600 13px "Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; cursor: pointer; box-shadow: 0 6px 18px rgba(0,0,0,.5); }
+  .fab.m { right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); padding: 10px 16px; font-size: 14px; }
+  /* ---------- 手機：底部抽屜＋卡片 ---------- */
+  .panel.mob { left: 0; right: 0; bottom: 0; top: auto; width: 100%; max-width: none; max-height: 82vh; border-radius: 16px 16px 0 0;
+    border-left: none; border-right: none; border-bottom: none; font-size: 14px; padding-bottom: env(safe-area-inset-bottom); }
+  .panel.mob .hd { cursor: pointer; position: relative; padding: 14px 12px 10px; }
+  .panel.mob .grab { position: absolute; left: 50%; top: 5px; width: 40px; height: 4px; margin-left: -20px; border-radius: 2px; background: #3a4558; }
+  .panel.mob .ttlw { flex-direction: column; gap: 0; align-items: flex-start; }
+  .panel.mob .sub { max-width: 100%; }
+  .panel.mob .tools button { font-size: 16px; padding: 6px 12px; min-width: 40px; }
+  .panel.mob .menu button { flex: 1 1 30%; justify-content: center; font-size: 13px; padding: 9px 6px; margin-left: 0; }
+  .panel.mob .tools button.ib { width: 40px; height: 36px; font-size: 17px; }
+  .panel.mob .bd { padding: 8px 10px 16px; }
+  .card { background: #1f2636; border: 1px solid #2d3748; border-radius: 10px; padding: 10px 11px; margin-bottom: 8px; cursor: pointer; }
+  .card.open { border-color: #2c7a7b; }
+  .c-top { display: flex; align-items: flex-start; gap: 8px; }
+  .c-nm { flex: 1; min-width: 0; }
+  .c-nm > b { color: #fff; font-size: 15px; font-weight: 700; margin-right: 2px; }
+  .c-nm small { display: block; color: #8b98ad; font-size: 12px; margin-top: 1px; }
+  .c-big { text-align: right; flex: none; }
+  .c-big b { display: block; color: #4FD1C5; font-size: 19px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.2; }
+  .c-big span { color: #8b98ad; font-size: 11px; }
+  .card .bar { margin: 7px 0 8px; height: 5px; }
+  .c-stats { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 5px; }
+  .cs { background: #171c27; border-radius: 7px; padding: 5px 7px; display: flex; flex-direction: column; min-width: 0; }
+  .cs span { color: #8b98ad; font-size: 11px; }
+  .cs b { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; }
+  .cs i { font-style: normal; color: #8b98ad; font-size: 10px; }
+  .cs.zero b { color: rgba(255,255,255,.25); }
+  .c-bst { margin-top: 7px; color: #8b98ad; font-size: 12px; line-height: 1.5; }
+  .c-more { margin-top: 7px; text-align: center; color: #4FD1C5; font-size: 12px; }
+  .c-det { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2d3748; cursor: default; }
+  .c-det .grid { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 3px 12px; font-size: 12.5px; }
+  .c-det .spl { font-size: 12.5px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
   `;
+
 
   function mount() {
     if (host || !document.body) return;
@@ -704,10 +757,7 @@
     return STAT_LABELS.filter(([, k]) => s[k] != null).map(([l, k]) => l + ' ' + fmt(num(s[k]))).join('｜');
   }
 
-  function unitRows(u, sideTot, mode) {
-    const dmg = u.dealt[mode], tot = dmg + u.luck, take = u.taken[mode];
-    const pct = sideTot > 0 ? tot / sideTot * 100 : 0;
-    const key = u.id;
+  function unitHead(u) {
     const tags = (u.dead ? '<span class="tag dead">倒下</span>' : '') + (u.isAssist ? '<span class="tag ast">支援</span>' : '') +
       (u.burn ? `<span class="tag burn">燒上限 −${fmt(u.burn)}</span>` : '') +
       (u.specialN ? `<span class="tag spx">特殊迴避 ×${u.specialN}</span>` : '') +
@@ -720,25 +770,21 @@
       (u.summonN ? `<span class="tag sum">召喚 ×${u.summonN}</span>` : '');
     const hp = u.hpLeft != null ? `剩餘 HP ${fmt(u.hpLeft)}${u.hpMax ? ' / ' + fmt(u.hpMax) : ''}` : '';
     const subline = [u.isSummon && u.ownerName ? '本體 ' + u.ownerName : '', u.sub, hp].filter(Boolean).join('｜');
-    const bst = u.isBoss && u.stats ? `<tr class="bst" data-key="${esc(key)}"><td colspan="8">${esc(statLine(u.stats))}</td></tr>` : '';
-    let html = `<tr class="u${bst ? ' hasbst' : ''}" data-key="${esc(key)}">
-      <td class="nm">${esc(u.name)}${tags}<small>${esc(subline)}</small></td>
-      ${cell(dmg, 'c-dmg')}${cell(u.luck, 'c-luck')}
-      <td class="c-tot${tot ? '' : ' zero'}">${fmt(tot)} <span class="pct">${pct.toFixed(1)}%</span><div class="bar"><i style="width:${Math.min(100, pct).toFixed(1)}%"></i></div></td>
-      ${cell(take, 'c-take')}${cell(u.heal, 'c-heal')}${cell(u.sp, 'c-sp')}${critCell(u.crit, u.hitN)}
-    </tr>` + bst;
-    if (state.open[key]) {
-      const k = u.byKind;
-      const item = (label, val, cls) => `<div${cls ? ` class="${cls}"` : ''}><span class="k">${label}</span>　<b>${val}</b></div>`;
-      let burnItems = '';
-      if (u.burn) {
-        const base = num(u.maxHpStat);
-        const after = base - u.burn;
-        burnItems = item('燒掉生命上限', fmt(u.burn) + '（' + u.burnN + ' 次）', 'burn') +
-          (base ? item('生命上限', fmt(base) + ' → ' + fmt(after) + '（−' + (u.burn / base * 100).toFixed(1) + '%）', 'burn') : '') +
-          item('每次燒', fmt(u.burn / u.burnN), 'burn');
-      }
-      html += `<tr class="det"><td colspan="8"><div class="grid">
+    return { tags, subline };
+  }
+
+  function detHtml(u, mode) {
+    const k = u.byKind;
+    const item = (label, val, cls) => `<div${cls ? ` class="${cls}"` : ''}><span class="k">${label}</span><b>${val}</b></div>`;
+    let burnItems = '';
+    if (u.burn) {
+      const base = num(u.maxHpStat);
+      const after = base - u.burn;
+      burnItems = item('燒掉生命上限', fmt(u.burn) + '（' + u.burnN + ' 次）', 'burn') +
+        (base ? item('生命上限', fmt(base) + ' → ' + fmt(after) + '（−' + (u.burn / base * 100).toFixed(1) + '%）', 'burn') : '') +
+        item('每次燒', fmt(u.burn / u.burnN), 'burn');
+    }
+    return `<div class="grid">
         ${burnItems}
         ${item('普攻傷害', fmt(k.normal[mode]) + '（' + k.normal.n + ' 下）')}
         ${item('技能傷害', fmt(k.skill[mode]) + '（' + k.skill.n + ' 下）')}
@@ -761,9 +807,48 @@
         ${item('被幸運砸中', u.luckTakenN + ' 次／' + fmt(u.luckTaken))}
         ${item('受到治療', fmt(u.healRecv))}
         ${item('獲得 SP', fmt(u.spRecv))}
-      </div>${dotList(u.dot, '異常狀態／持續傷害（這個角色造成的）')}${dotList(u.dotTaken, '受到的異常狀態／持續傷害')}${dotList(u.passiveDot, '反傷（這個角色造成的）')}${dotList(u.passiveTaken, '受到的反傷')}${simmerList(u)}${specialList(u)}</td></tr>`;
-    }
+      </div>${dotList(u.dot, '異常狀態／持續傷害（這個角色造成的）')}${dotList(u.dotTaken, '受到的異常狀態／持續傷害')}${dotList(u.passiveDot, '反傷（這個角色造成的）')}${dotList(u.passiveTaken, '受到的反傷')}${simmerList(u)}${specialList(u)}`;
+  }
+
+  // 電腦：表格的一列
+  function unitRows(u, sideTot, mode) {
+    const dmg = u.dealt[mode], tot = dmg + u.luck, take = u.taken[mode];
+    const pct = sideTot > 0 ? tot / sideTot * 100 : 0;
+    const key = u.id;
+    const { tags, subline } = unitHead(u);
+    const bst = u.isBoss && u.stats ? `<tr class="bst" data-key="${esc(key)}"><td colspan="8">${esc(statLine(u.stats))}</td></tr>` : '';
+    let html = `<tr class="u${bst ? ' hasbst' : ''}${state.open[key] ? ' open' : ''}" data-key="${esc(key)}">
+      <td class="nm"><span class="arw">${state.open[key] ? '▾' : '▸'}</span>${esc(u.name)}${tags}<small>${esc(subline)}</small></td>
+      ${cell(dmg, 'c-dmg')}${cell(u.luck, 'c-luck')}
+      <td class="c-tot${tot ? '' : ' zero'}">${fmt(tot)} <span class="pct">${pct.toFixed(1)}%</span><div class="bar"><i style="width:${Math.min(100, pct).toFixed(1)}%"></i></div></td>
+      ${cell(take, 'c-take')}${cell(u.heal, 'c-heal')}${cell(u.sp, 'c-sp')}${critCell(u.crit, u.hitN)}
+    </tr>` + bst;
+    if (state.open[key]) html += `<tr class="det"><td colspan="8">${detHtml(u, mode)}</td></tr>`;
     return html;
+  }
+
+  // 手機：每個角色一張卡片，主數字放大，其他數字排成格子；點卡片展開細項
+  function unitCard(u, sideTot, mode) {
+    const dmg = u.dealt[mode], tot = dmg + u.luck, take = u.taken[mode];
+    const pct = sideTot > 0 ? tot / sideTot * 100 : 0;
+    const key = u.id, open = !!state.open[key];
+    const { tags, subline } = unitHead(u);
+    const st = (label, v, cls) => `<div class="cs ${cls}${v ? '' : ' zero'}"><span>${label}</span><b>${fmt(v)}</b></div>`;
+    return `<div class="card${open ? ' open' : ''}" data-key="${esc(key)}">
+      <div class="c-top">
+        <div class="c-nm"><b>${esc(u.name)}</b>${tags}${subline ? `<small>${esc(subline)}</small>` : ''}</div>
+        <div class="c-big${tot ? '' : ' zero'}"><b>${fmt(tot)}</b><span>${pct.toFixed(1)}%</span></div>
+      </div>
+      <div class="bar"><i style="width:${Math.min(100, pct).toFixed(1)}%"></i></div>
+      <div class="c-stats">
+        ${st('造成', dmg, 'c-dmg')}${st('幸運', u.luck, 'c-luck')}${st('承受', take, 'c-take')}
+        ${st('回血', u.heal, 'c-heal')}${st('回SP', u.sp, 'c-sp')}
+        <div class="cs c-crit${u.hitN ? '' : ' zero'}"><span>爆擊</span><b>${critPct(u.crit, u.hitN)}</b><i>${u.crit}/${u.hitN}</i></div>
+      </div>
+      ${u.isBoss && u.stats ? `<div class="c-bst">${esc(statLine(u.stats))}</div>` : ''}
+      <div class="c-more">${open ? '▴ 收起細項' : '▾ 點開看細項'}</div>
+      ${open ? `<div class="c-det">${detHtml(u, mode)}</div>` : ''}
+    </div>`;
   }
 
   function dotList(obj, title) {
@@ -797,8 +882,8 @@
         .map(([n, b]) => `<div class="rst">　${esc(n)} 放的<b>${fmt(b.dmg)}</b>（${b.n} 次）</div>`).join('');
     }
     if (s.bin.length) {
-      h += `<div class="dotl">・回收桶<b>${s.bin.length} 次</b></div>` +
-        s.bin.map(x => `<div class="rst">　${esc(x.msg.length > 60 ? x.msg.slice(0, 60) + '…' : x.msg)}${x.v ? `<b>${fmt(x.v)}</b>` : ''}</div>`).join('');
+      h += `<div class="dotl">・回收桶<b>${s.bin.length} 次</b>，爬出來共回復<b>${fmt(s.binHeal)}</b> HP</div>` +
+        s.bin.map((x, i) => `<div class="rst">　第 ${i + 1} 次：${esc(x.who || '？')} 被打進回收桶${x.heal != null ? `，爬出來回復<b>${fmt(x.heal)}</b>` : ''}</div>`).join('');
     }
     return h ? `<div class="spl"><span class="k">西米料理（番茄湯／臭臭茶／回收桶）</span>${h}</div>` : '';
   }
@@ -829,16 +914,36 @@
       </tbody></table></div>`;
   }
 
+  function sideCards(rep, units, side, mode) {
+    const list = units.filter(u => u.side === side);
+    if (!list.length) return '';
+    const S = list.reduce((s, u) => { s.dmg += u.dealt[mode]; s.luck += u.luck; s.take += u.taken[mode]; s.heal += u.heal; return s; },
+      { dmg: 0, luck: 0, take: 0, heal: 0 });
+    const tot = S.dmg + S.luck;
+    list.sort((a, b) => (b.dealt[mode] + b.luck) - (a.dealt[mode] + a.luck));
+    return `<div class="side">
+      <div class="side-hd">${sideLabel(rep, side)}<span>${list.length} 名${list.length > 1 ? `・總計 ${fmt(tot)}・承受 ${fmt(S.take)}${S.heal ? '・回血 ' + fmt(S.heal) : ''}` : ''}</span></div>
+      ${list.map(u => unitCard(u, tot, mode)).join('')}
+    </div>`;
+  }
+
+  // 窄螢幕（手機直拿）改用卡片＋底部抽屜；轉橫或電腦就回到表格
+  const narrow = () => { try { return matchMedia('(max-width: 640px)').matches; } catch (e) { return false; } };
+  let wasNarrow = null;
+  window.addEventListener('resize', () => { const n = narrow(); if (n !== wasNarrow && currentId) render(); });
+
   function render() {
     if (!currentId) return;
     mount();
     if (!root) return;
+    const mob = narrow();
+    wasNarrow = mob;
     const pos = state.pos;
-    const posStyle = pos
+    const posStyle = mob ? '' : pos
       ? `left:${Math.max(0, Math.min(pos.left, document.documentElement.clientWidth - 160))}px;top:${Math.max(0, Math.min(pos.top, document.documentElement.clientHeight - 40))}px;`
       : 'right:16px;top:72px;';
     if (state.hidden) {
-      root.innerHTML = `<style>${CSS}</style><button class="fab" data-act="show">戰報統計</button>`;
+      root.innerHTML = `<style>${CSS}</style><button class="fab${mob ? ' m' : ''}" data-act="show">📊 戰報統計</button>`;
       return;
     }
     const rep = cache.get(currentId);
@@ -850,95 +955,64 @@
       const units = analyze(rep);
       const t = rep.createdAt ? new Date(rep.createdAt).toLocaleString() : '';
       sub = `#${currentId}・${rep.battleType || ''}・${RESULT[rep.result] || rep.result || ''}・${t}`;
-      body = sideTable(rep, units, 'A', mode) + sideTable(rep, units, 'B', mode) + sideTable(rep, units, 'C', mode);
+      const fn = mob ? sideCards : sideTable;
+      body = fn(rep, units, 'A', mode) + fn(rep, units, 'B', mode) + fn(rep, units, 'C', mode);
     } else if (errors[currentId]) {
       body = `<div class="msg err">${esc(errors[currentId])}</div>`;
     } else {
       body = `<div class="msg">${esc(statusText || '等待戰報資料…')}</div>`;
     }
+    const col = state.collapsed;
+    const menuBar = `
+            <button data-act="export" title="匯出累積的逐筆傷害樣本（CSV，給傷害公式迴歸用）">📦 匯出樣本 <em>${sampleCount()}</em></button>
+            <button data-act="dex" title="匯出累積的 BOSS 圖鑑（樓層、數值、用過的技能）">👑 匯出王鑑 <em>${bossCount()}</em></button>
+            <button data-act="purge" class="warn" title="清空累積的傷害樣本（要按兩次）">🗑 清空樣本</button>`;
     root.innerHTML = `<style>${CSS}</style>
-      <div class="panel" style="${posStyle}">
-        <div class="hd" data-drag="1">
-          <span class="ttl">戰報統計</span><span class="sub">${esc(sub)}</span>
+      <div class="panel${mob ? ' mob' : ''}${col ? ' col' : ''}" style="${posStyle}">
+        <div class="hd"${mob ? ' data-act="collapse"' : ' data-drag="1"'}>
+          ${mob ? '<span class="grab"></span>' : ''}
+          <div class="ttlw"><span class="ttl">📊 戰報統計</span>${col ? '' : `<span class="sub">${esc(sub)}</span>`}</div>
           <div class="tools">
-            <button data-act="mode" class="on" title="切換實際扣血／戰報數字">${mode === 'real' ? '實際扣血' : '戰報數字'}</button>
-            <button data-act="copy" title="複製文字版統計">複製</button>
-            <button data-act="export" title="匯出累積的逐筆傷害樣本（CSV，給傷害公式迴歸用）">樣本 ${sampleCount()}</button>
-            <button data-act="dex" title="匯出累積的 BOSS 圖鑑（樓層、數值、用過的技能）">王鑑 ${bossCount()}</button>
-            <button data-act="purge" title="清空累積的傷害樣本">清空</button>
-            <button data-act="reload" title="重新讀取這份戰報">重讀</button>
-            <button data-act="collapse" title="收合／展開">${state.collapsed ? '＋' : '－'}</button>
-            <button data-act="hide" title="縮到右下角">×</button>
+            ${col ? '' : `<button data-act="menu" class="ib${state.menu ? ' on' : ''}" title="樣本／王鑑／清空">⋯</button>`}
+            <button data-act="collapse" class="ib" title="${col ? '展開' : '收合'}">${col ? (mob ? '▴' : '＋') : (mob ? '▾' : '－')}</button>
+            <button data-act="hide" class="ib" title="縮成小按鈕">✕</button>
           </div>
         </div>
-        ${state.collapsed ? '' : `<div class="bd">${body}</div>`}
+        ${state.menu && !col ? `<div class="menu">${menuBar}</div>` : ''}
+        ${col ? '' : `<div class="bd">${body}</div>`}
       </div>`;
-  }
-
-  function copyText() {
-    const rep = cache.get(currentId);
-    if (!rep) return;
-    const mode = state.mode;
-    const units = analyze(rep);
-    const lines = [`戰報 #${currentId}（${rep.battleType || ''}｜${RESULT[rep.result] || rep.result || ''}）${mode === 'real' ? '［實際扣血］' : '［戰報數字］'}`];
-    ['A', 'B', 'C'].forEach(side => {
-      const list = units.filter(u => u.side === side);
-      if (!list.length) return;
-      lines.push(`【${sideLabel(rep, side)}】`);
-      list.sort((a, b) => (b.dealt[mode] + b.luck) - (a.dealt[mode] + a.luck)).forEach(u => {
-        const d = u.dealt[mode];
-        lines.push(`${u.name}${u.sub ? '(' + u.sub + ')' : ''}　造成 ${fmt(d)}｜幸運 ${fmt(u.luck)}｜總計 ${fmt(d + u.luck)}｜承受 ${fmt(u.taken[mode])}｜回血 ${fmt(u.heal)}｜回SP ${fmt(u.sp)}｜爆擊 ${critPct(u.crit, u.hitN)}（${u.crit}/${u.hitN}）${u.luk != null ? '｜幸運值 ' + u.luk : ''}` +
-          (u.burn ? `｜燒上限 ${fmt(u.burn)}（${u.burnN} 次）` : '') +
-          (u.specialN ? `｜特殊迴避 ${u.specialN} 次` : '') +
-          (Object.keys(u.dot).length ? '｜異常狀態 ' + Object.entries(u.dot).map(([n, d]) => `${n} ${fmt(d.dmg)}${d.restore ? '（回復 −' + fmt(d.restore) + '）' : ''}`).join('、') : '') +
-          (Object.keys(u.passiveDot).length ? '｜反傷 ' + Object.entries(u.passiveDot).map(([n, d]) => `${n} ${fmt(d.dmg)}`).join('、') : ''));
-      });
-    });
-    const text = lines.join('\n');
-    const done = () => { const b = root && root.querySelector('[data-act="copy"]'); if (b) { b.textContent = '已複製'; setTimeout(() => { if (b.isConnected) b.textContent = '複製'; }, 1500); } };
-    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
-    else fallbackCopy(text, done);
-  }
-  function fallbackCopy(text, done) {
-    const ta = document.createElement('textarea');
-    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.select();
-    try { document.execCommand('copy'); done(); } catch (e) {}
-    ta.remove();
   }
 
   function onClick(e) {
     const btn = e.target.closest('[data-act]');
     if (btn) {
       const act = btn.dataset.act;
-      if (act === 'mode') { state.mode = state.mode === 'real' ? 'shown' : 'real'; save('mode', state.mode); render(); }
-      else if (act === 'copy') copyText();
-      else if (act === 'export') {
+      if (act === 'export') {
         const n2 = exportSamples();
         btn.textContent = n2 ? '已匯出 ' + n2 : '沒有樣本';
-        setTimeout(() => { if (btn.isConnected) btn.textContent = '樣本 ' + sampleCount(); }, 1800);
+        setTimeout(() => { if (btn.isConnected) render(); }, 1800);
       }
       else if (act === 'dex') {
         const n3 = exportDex();
         btn.textContent = n3 ? '已匯出 ' + n3 : '還沒有王';
-        setTimeout(() => { if (btn.isConnected) btn.textContent = '王鑑 ' + bossCount(); }, 1800);
+        setTimeout(() => { if (btn.isConnected) render(); }, 1800);
       }
       else if (act === 'purge') {
         if (btn.dataset.sure === '1') {
           try { localStorage.removeItem(SAMP_KEY); localStorage.removeItem(SAMP_IDS); } catch (e) {}
           SAMP_N = 0; render();
         } else {
-          btn.dataset.sure = '1'; btn.textContent = '再按一次';
-          setTimeout(() => { if (btn.isConnected) { btn.dataset.sure = ''; btn.textContent = '清空'; } }, 3000);
+          btn.dataset.sure = '1'; btn.textContent = '⚠ 再按一次確認清空';
+          setTimeout(() => { if (btn.isConnected) { btn.dataset.sure = ''; btn.textContent = '🗑 清空樣本'; } }, 3000);
         }
       }
-      else if (act === 'reload') { cache.delete(currentId); ensureData(currentId, true); }
-      else if (act === 'collapse') { state.collapsed = !state.collapsed; save('collapsed', state.collapsed); render(); }
+      else if (act === 'collapse') { if (e.target.closest('button') && e.target.closest('button') !== btn) return; state.collapsed = !state.collapsed; if (state.collapsed) state.menu = false; save('collapsed', state.collapsed); render(); }
+      else if (act === 'menu') { state.menu = !state.menu; render(); }
       else if (act === 'hide') { state.hidden = true; render(); }
       else if (act === 'show') { state.hidden = false; render(); }
       return;
     }
-    const row = e.target.closest('tr[data-key]');
+    const row = e.target.closest('tr[data-key], .card[data-key]');
     if (row) { const k = row.dataset.key; state.open[k] = !state.open[k]; render(); }
   }
 
