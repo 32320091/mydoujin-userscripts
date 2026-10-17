@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         我的同人｜戰報統計面板
 // @namespace    mydoujin-battle-stats
-// @version      1.13.0
-// @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷；並自動累積逐筆傷害樣本與 BOSS 圖鑑（數值＋使用過的技能），可匯出 CSV
+// @version      1.14.0
+// @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷
 // @match        https://mydoujin.online/*
 // @run-at       document-start
 // @grant        none
@@ -19,7 +19,7 @@
   let currentId = null;
   let host = null, root = null;
   let statusText = '';
-  const state = { menu: false,
+  const state = {
     mode: 'shown',                     // 固定用戰報文字上的數字（已移除「實際扣血」切換）
     collapsed: load('collapsed', false),
     hidden: false,
@@ -424,186 +424,8 @@
     return units;
   }
 
-  /* ---------- 傷害樣本累積（給傷害／爆擊／命中公式迴歸用） ----------
-     每看過一份戰報就把逐筆傷害存進 localStorage，同一份戰報只會存一次。
-     欄位刻意包含「段」（第N擊）與攻守雙方九項能力，因為多段技能每段基礎值差很多，
-     不分段做迴歸會被雜訊蓋掉。 */
-  const SAMP_KEY = 'mdbs:samples', SAMP_IDS = 'mdbs:sampleIds';
-  const SAMP_MAX = 30000, SAMP_ID_MAX = 3000;
-  const SAMP_COLS = ['戰報', '時間', '類型', '技能', '階級', '段', '來源', '被動',
-    '攻方', '攻方等級', '攻擊', '智力', '技巧', '敏捷', '速度', '體力', '幸運',
-    '守方', '守方防禦', '守方等級', '戰報傷害', '實際扣血', '爆擊', '格擋', '普攻', '反擊'];
-  let SAMP_N = -1;
-
-  function loadSamples() { try { return JSON.parse(localStorage.getItem(SAMP_KEY) || '[]'); } catch (e) { return []; } }
-  function loadSampledIds() { try { return JSON.parse(localStorage.getItem(SAMP_IDS) || '[]'); } catch (e) { return []; } }
-  function sampleCount() { if (SAMP_N < 0) SAMP_N = loadSamples().length; return SAMP_N; }
-
-  function collectSamples(id, rep) {
-    const key = String(id);
-    const ids = loadSampledIds();
-    if (ids.indexOf(key) >= 0) return;
-    const P = rep.participants || {};
-    const S = {}, NM = {}, LV = {};
-    [...(P.players || []), ...(P.enemies || [])].forEach(p => {
-      const k = p.userId || p.entityId || p._id || p.name;
-      S[k] = p.stats || {}; NM[k] = p.characterName || p.name || '?';
-      LV[k] = p.level == null ? '' : p.level;
-    });
-    // 召喚物（分身）：participants 裡沒有，能力值沿用召喚者，名稱用戰報寫的分身名以便迴歸時分開
-    (rep.logs || []).forEach(l => {
-      if (!l || l.type !== 'SUMMON' || !l.targetId) return;
-      const o = l.actorId;
-      if (S[o] && !S[l.targetId]) { S[l.targetId] = S[o]; LV[l.targetId] = LV[o]; }
-      const mn = String(l.message || '').match(/^\s*(\S+?)\s/);
-      NM[l.targetId] = (mn && mn[1]) || ((NM[o] || '') + '的分身');
-    });
-    const ts = rep.createdAt || '';
-    const rows = [];
-    (rep.logs || []).forEach(l => {
-      if (!l || typeof l !== 'object') return;
-      const ty = l.type;
-      if (ty !== 'DAMAGE' && ty !== 'BLOCK' && ty !== 'COUNTER' && ty !== 'MISS' && ty !== 'LUCK_EVENT') return;
-      // 幸運事件的 actorId 是被砸中的人，真正的來源是 opponentId
-      const aid = ty === 'LUCK_EVENT' ? l.opponentId : l.actorId;
-      const tid = l.targetId || (ty === 'LUCK_EVENT' ? l.actorId : null);
-      const a = S[aid], t = S[tid];
-      if (!a && !t) return;
-      const v = num(l.value);
-      const real = l.actualDamage != null ? num(l.actualDamage) : v;
-      const msg = String(l.message || '');
-      const seg = (msg.match(/第\s*(\d+)\s*[擊道發]/) || [])[1] || '';
-      rows.push([key, ts, ty, l.skillId || '', l.skillTier || '', seg, l.source || '', l.passiveId || '',
-        NM[aid] || '', LV[aid] == null ? '' : LV[aid],
-        a ? num(a.atk) : '', a ? num(a.int) : '', a ? num(a.tec) : '', a ? num(a.agi) : '',
-        a ? num(a.spd) : '', a ? num(a.sta) : '', a ? num(a.luk) : '',
-        NM[tid] || '', t ? num(t.def) : '', LV[tid] == null ? '' : LV[tid],
-        ty === 'MISS' ? 0 : v, ty === 'MISS' ? 0 : real,
-        l.isCrit ? 1 : 0, (l.blocked || ty === 'BLOCK') ? 1 : 0, l.isNormalAttack ? 1 : 0, l.isCounter ? 1 : 0]);
-    });
-    let all = loadSamples().concat(rows);
-    if (all.length > SAMP_MAX) all = all.slice(all.length - SAMP_MAX);
-    ids.push(key);
-    const idArr = ids.length > SAMP_ID_MAX ? ids.slice(ids.length - SAMP_ID_MAX) : ids;
-    if (!writeSamples(all, idArr)) {
-      // 空間不足：砍掉最舊的一半再試一次
-      const half = all.slice(Math.floor(all.length / 2));
-      if (writeSamples(half, idArr)) all = half; else return;
-    }
-    SAMP_N = all.length;
-  }
-
-  function writeSamples(all, idArr) {
-    try {
-      localStorage.setItem(SAMP_KEY, JSON.stringify(all));
-      localStorage.setItem(SAMP_IDS, JSON.stringify(idArr));
-      return true;
-    } catch (e) { return false; }
-  }
-
-  /* ---------- BOSS 圖鑑累積 ----------
-     每看過一份 BOSS 戰報，就把王的樓層、等級、九項能力與「牠用過的每一個技能」存進 localStorage。
-     同一份戰報只會併入一次；技能以 skillId（被動用 passiveId）為鍵累積次數／傷害／爆擊。 */
-  const BOSS_KEY = 'mdbs:bossdex', BOSS_IDS = 'mdbs:bossdexIds';
-  const BOSS_COLS = ['樓層', '名稱', '稱號', '等級', 'HP', '攻擊', '防禦', '體力', '敏捷', '反應速度', '技巧', '智力', '幸運',
-    '取樣場次', '技能ID', '招式名', '類型', '反擊', '使用次數', '造成傷害次數', '平均傷害', '最大傷害', '爆擊次數'];
-  let BOSS_N = -1;
-
-  function loadDex() { try { return JSON.parse(localStorage.getItem(BOSS_KEY) || '{}') || {}; } catch (e) { return {}; } }
-  function loadDexIds() { try { return JSON.parse(localStorage.getItem(BOSS_IDS) || '[]'); } catch (e) { return []; } }
-  function bossCount() { if (BOSS_N < 0) BOSS_N = Object.keys(loadDex()).length; return BOSS_N; }
-
-  function collectBosses(id, rep) {
-    const en = rep && rep.participants && rep.participants.enemies;
-    if (!Array.isArray(en) || !en.length) return;
-    const ids = loadDexIds();
-    const key = String(id);
-    if (ids.indexOf(key) >= 0) return;
-    const dex = loadDex();
-    const map = {};
-    let touched = false;
-    en.forEach(e => {
-      if (!e || !e.stats || !(e.entityId || e.monsterId)) return;
-      const mk = e.monsterId || e.name;
-      map[e.entityId || e._id] = mk;
-      const b = dex[mk] || (dex[mk] = { 名稱: e.name, 稱號: e.title || '', 樓層: {}, 等級: e.level, 數值: e.stats, 技能: {}, 場次: 0 });
-      b.名稱 = e.name; if (e.title) b.稱號 = e.title;
-      if (e.level != null) b.等級 = e.level;
-      if (e.stats) b.數值 = e.stats;
-      if (e.floor != null) b.樓層[e.floor] = (b.樓層[e.floor] || 0) + 1;
-      b.場次++; touched = true;
-    });
-    if (!touched) return;
-    (rep.logs || []).forEach(l => {
-      const mk = map[l.actorId];
-      if (!mk) return;
-      const sid = l.skillId || (l.passiveId ? '被動:' + l.passiveId : null);
-      if (!sid) return;
-      const b = dex[mk];
-      const t = b.技能[sid] || (b.技能[sid] = { n: 0, dn: 0, sum: 0, max: 0, crit: 0, 普攻: false, 反擊: false, 名: '' });
-      t.n++;
-      if (l.isNormalAttack) t.普攻 = true;
-      if (l.isCounter) t.反擊 = true;
-      if (l.isCrit) t.crit++;
-      if (l.type === 'DAMAGE') { const v = num(l.value); t.dn++; t.sum += v; if (v > t.max) t.max = v; }
-      if (!t.名 && l.message) {
-        const m = String(l.message).match(new RegExp('^' + escRe(String(b.名稱 || '')) + '\\s*(.{2,20}?)[，,、：:]'));
-        if (m) t.名 = m[1];
-      }
-    });
-    ids.push(key);
-    const idArr = ids.length > SAMP_ID_MAX ? ids.slice(ids.length - SAMP_ID_MAX) : ids;
-    try {
-      localStorage.setItem(BOSS_KEY, JSON.stringify(dex));
-      localStorage.setItem(BOSS_IDS, JSON.stringify(idArr));
-      BOSS_N = Object.keys(dex).length;
-    } catch (e) {}
-  }
-
-  function exportDex() {
-    const dex = loadDex();
-    const keys = Object.keys(dex);
-    if (!keys.length) return 0;
-    const rows = [];
-    keys.map(k => dex[k])
-      .sort((a, b) => (Math.min.apply(null, Object.keys(a.樓層).map(Number).concat([9999]))) - (Math.min.apply(null, Object.keys(b.樓層).map(Number).concat([9999]))) || String(a.名稱).localeCompare(String(b.名稱)))
-      .forEach(b => {
-        const f = Object.keys(b.樓層).map(Number).sort((x, y) => x - y).join('/');
-        const s2 = b.數值 || {};
-        const base = [f, b.名稱, b.稱號, b.等級, s2.hp, s2.atk, s2.def, s2.sta, s2.agi, s2.spd, s2.tec, s2.int, s2.luk, b.場次];
-        const sk = Object.entries(b.技能).sort((x, y) => y[1].n - x[1].n);
-        if (!sk.length) { rows.push(base.concat(['', '', '', '', '', '', '', '', ''])); return; }
-        sk.forEach(([sid, t]) => rows.push(base.concat([sid, t.名, t.普攻 ? '普攻' : (sid.indexOf('被動:') === 0 ? '被動' : '技能'),
-          t.反擊 ? 'Y' : '', t.n, t.dn, t.dn ? Math.round(t.sum / t.dn) : '', t.max, t.crit])));
-      });
-    const q = x => { const v = String(x == null ? '' : x); return /[",\n]/.test(v) ? '"' + v.split('"').join('""') + '"' : v; };
-    const csv = '\ufeff' + [BOSS_COLS.join(',')].concat(rows.map(r => r.map(q).join(','))).join('\r\n');
-    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
-    const d = new Date();
-    const p2 = x => String(x).padStart(2, '0');
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'mydoujin_bossdex_' + d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate()) + '_' + keys.length + '.csv';
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 8000);
-    return keys.length;
-  }
-
-  function exportSamples() {
-    const rows = loadSamples();
-    if (!rows.length) return 0;
-    const q = x => { const v = String(x == null ? '' : x); return /[",\n]/.test(v) ? '"' + v.split('"').join('""') + '"' : v; };
-    const csv = '﻿' + [SAMP_COLS.join(',')].concat(rows.map(r => r.map(q).join(','))).join('\r\n');
-    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
-    const d = new Date();
-    const p2 = x => String(x).padStart(2, '0');
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'mydoujin_damage_samples_' + d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate()) + '_' + rows.length + '.csv';
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 8000);
-    return rows.length;
-  }
+  /* 舊版累積的傷害樣本與 BOSS 圖鑑已停用，順手把留在 localStorage 的舊資料清掉，釋放空間 */
+  try { ['mdbs:samples', 'mdbs:sampleIds', 'mdbs:bossdex', 'mdbs:bossdexIds'].forEach(k => localStorage.removeItem(k)); } catch (e) {}
 
   /* ---------- UI ---------- */
   const fmt = n => Math.round(n).toLocaleString('en-US');
@@ -628,11 +450,6 @@
   button.ib { width: 30px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 15px; line-height: 1; }
   .panel.col { width: auto; min-width: 240px; }
   .panel.col .hd { border-bottom: none; }
-  .menu { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px; background: #121722; border-bottom: 1px solid #2d3748; }
-  .menu button { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; padding: 6px 12px; }
-  .menu button em { font-style: normal; color: #4FD1C5; font-weight: 700; font-variant-numeric: tabular-nums; }
-  .menu button.warn { color: #f6878b; border-color: rgba(246,135,139,.45); margin-left: auto; }
-  .menu button.warn:hover { background: rgba(246,135,139,.12); }
   .bd { overflow: auto; padding: 10px 12px 14px; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
   .side { margin-bottom: 14px; }
   .side-hd { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-weight: 700; color: #e2c897; margin: 2px 2px 6px; }
@@ -696,7 +513,6 @@
   .panel.mob .ttlw { flex-direction: column; gap: 0; align-items: flex-start; }
   .panel.mob .sub { max-width: 100%; }
   .panel.mob .tools button { font-size: 16px; padding: 6px 12px; min-width: 40px; }
-  .panel.mob .menu button { flex: 1 1 30%; justify-content: center; font-size: 13px; padding: 9px 6px; margin-left: 0; }
   .panel.mob .tools button.ib { width: 40px; height: 36px; font-size: 17px; }
   .panel.mob .bd { padding: 8px 10px 16px; }
   .card { background: #1f2636; border: 1px solid #2d3748; border-radius: 10px; padding: 10px 11px; margin-bottom: 8px; cursor: pointer; }
@@ -950,8 +766,6 @@
     const mode = state.mode;
     let sub = '#' + currentId, body;
     if (rep) {
-      try { collectSamples(currentId, rep); } catch (e) {}
-      try { collectBosses(currentId, rep); } catch (e) {}
       const units = analyze(rep);
       const t = rep.createdAt ? new Date(rep.createdAt).toLocaleString() : '';
       sub = `#${currentId}・${rep.battleType || ''}・${RESULT[rep.result] || rep.result || ''}・${t}`;
@@ -963,22 +777,16 @@
       body = `<div class="msg">${esc(statusText || '等待戰報資料…')}</div>`;
     }
     const col = state.collapsed;
-    const menuBar = `
-            <button data-act="export" title="匯出累積的逐筆傷害樣本（CSV，給傷害公式迴歸用）">📦 匯出樣本 <em>${sampleCount()}</em></button>
-            <button data-act="dex" title="匯出累積的 BOSS 圖鑑（樓層、數值、用過的技能）">👑 匯出王鑑 <em>${bossCount()}</em></button>
-            <button data-act="purge" class="warn" title="清空累積的傷害樣本（要按兩次）">🗑 清空樣本</button>`;
     root.innerHTML = `<style>${CSS}</style>
       <div class="panel${mob ? ' mob' : ''}${col ? ' col' : ''}" style="${posStyle}">
         <div class="hd"${mob ? ' data-act="collapse"' : ' data-drag="1"'}>
           ${mob ? '<span class="grab"></span>' : ''}
           <div class="ttlw"><span class="ttl">📊 戰報統計</span>${col ? '' : `<span class="sub">${esc(sub)}</span>`}</div>
           <div class="tools">
-            ${col ? '' : `<button data-act="menu" class="ib${state.menu ? ' on' : ''}" title="樣本／王鑑／清空">⋯</button>`}
             <button data-act="collapse" class="ib" title="${col ? '展開' : '收合'}">${col ? (mob ? '▴' : '＋') : (mob ? '▾' : '－')}</button>
             <button data-act="hide" class="ib" title="縮成小按鈕">✕</button>
           </div>
         </div>
-        ${state.menu && !col ? `<div class="menu">${menuBar}</div>` : ''}
         ${col ? '' : `<div class="bd">${body}</div>`}
       </div>`;
   }
@@ -987,27 +795,7 @@
     const btn = e.target.closest('[data-act]');
     if (btn) {
       const act = btn.dataset.act;
-      if (act === 'export') {
-        const n2 = exportSamples();
-        btn.textContent = n2 ? '已匯出 ' + n2 : '沒有樣本';
-        setTimeout(() => { if (btn.isConnected) render(); }, 1800);
-      }
-      else if (act === 'dex') {
-        const n3 = exportDex();
-        btn.textContent = n3 ? '已匯出 ' + n3 : '還沒有王';
-        setTimeout(() => { if (btn.isConnected) render(); }, 1800);
-      }
-      else if (act === 'purge') {
-        if (btn.dataset.sure === '1') {
-          try { localStorage.removeItem(SAMP_KEY); localStorage.removeItem(SAMP_IDS); } catch (e) {}
-          SAMP_N = 0; render();
-        } else {
-          btn.dataset.sure = '1'; btn.textContent = '⚠ 再按一次確認清空';
-          setTimeout(() => { if (btn.isConnected) { btn.dataset.sure = ''; btn.textContent = '🗑 清空樣本'; } }, 3000);
-        }
-      }
-      else if (act === 'collapse') { if (e.target.closest('button') && e.target.closest('button') !== btn) return; state.collapsed = !state.collapsed; if (state.collapsed) state.menu = false; save('collapsed', state.collapsed); render(); }
-      else if (act === 'menu') { state.menu = !state.menu; render(); }
+      if (act === 'collapse') { if (e.target.closest('button') && e.target.closest('button') !== btn) return; state.collapsed = !state.collapsed; save('collapsed', state.collapsed); render(); }
       else if (act === 'hide') { state.hidden = true; render(); }
       else if (act === 'show') { state.hidden = false; render(); }
       return;
