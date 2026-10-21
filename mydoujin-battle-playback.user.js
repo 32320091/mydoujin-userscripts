@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報逐行播放
 // @namespace    mydoujin-battle-playback
-// @version      1.2.2
+// @version      1.2.3
 // @description  Boss 挑戰、玩家切磋／茶渡、事件遭遇戰、戰報頁回放：戰鬥過程一行一行出現，勝負、死亡標記與死亡橫幅等到最後一行才揭曉。可調每行間隔，或切回直接顯示結果；每一行後面顯示被打／被補的人剩多少血
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -31,12 +31,19 @@
   /* ---------- 結果遮蔽 ---------- */
   const DEATH_BANNER = '你的角色死亡了，請進行轉生';
   const STATUS_RE = /^.+ · Lv\.\d+ · (死亡|存活)$/;
+  const OUTCOME_RE = /^(勝利|失敗|敗北|平手|平局|死亡)$/;
   let guard = false, guardTimer = null;        // 戰鬥送出後到播放結束前，都要蓋住結果
   function ensureStyle() {
     if (document.getElementById('mdp-style')) return;
     const st = document.createElement('style');
     st.id = 'mdp-style';
     st.textContent = '[data-mdp-hide]{visibility:hidden !important}[data-mdp-gone]{display:none !important}' +
+      // 播放中／等戰報時：對話框標題（戰報）後面的標籤直接用 CSS 蓋住，React 重畫也不會露出來
+      // 逐行模式：戰報視窗一打開就先蓋住，播完（data-mdp-reveal）才露出
+      'html[data-mdp-playing] [data-part="title"] ~ *, html[data-mdp-guard] [data-part="title"] ~ *,' +
+      'html.mdp-step:not([data-mdp-reveal]) [data-mdp-report] [data-part="title"] ~ *,' +
+      'html.mdp-step:not([data-mdp-reveal]) [data-mdp-report] h2 ~ span,' +
+      'html[data-mdp-playing] [role="dialog"] h2 ~ span, html[data-mdp-guard] [role="dialog"] h2 ~ span{visibility:hidden !important}' +
       // 事件視窗的「遭遇戰鬥！ (勝利)」：把原字縮成 0、換成不帶結果的字，顏色也統一（原本勝負用不同顏色）
       '[data-mdp-enc]{font-size:0 !important;color:#a0aec0 !important}' +
       '[data-mdp-enc]::after{content:"遭遇戰鬥！（勝負在戰報最後揭曉）";font-size:14px;font-weight:700}';
@@ -52,11 +59,18 @@
     document.querySelectorAll('p').forEach(p => {
       if (p.childElementCount === 0 && STATUS_RE.test(p.textContent.trim())) p.setAttribute('data-mdp-hide', '');
     });
-    // 戰報視窗標題旁的「勝利／失敗／平手」「死亡」標籤
-    document.querySelectorAll('[role="dialog"]').forEach(dlg => {
-      const title = [...dlg.querySelectorAll('h2, h3, p, div')].find(e => e.childElementCount === 0 && e.textContent.trim() === '戰報');
-      let s = title && title.nextElementSibling;
-      while (s) { s.setAttribute('data-mdp-hide', ''); s = s.nextElementSibling; }
+    // 戰報視窗裡的「勝利／失敗／平手／平局」「死亡」標籤：直接找文字，不靠標題位置（Boss 頁的視窗結構不同）
+    document.querySelectorAll('[role="dialog"], [role="alertdialog"], [data-scope="dialog"][data-part="content"]').forEach(dlg => {
+      dlg.querySelectorAll('span, p, div').forEach(e => {
+        if (e.childElementCount === 0 && OUTCOME_RE.test(e.textContent.trim()) && !e.closest('[data-mdp-bar]')) e.setAttribute('data-mdp-hide', '');
+      });
+    });
+    // 標題「戰報」後面的勝負、死亡標籤蓋住；不限定在 role=dialog 裡
+    document.querySelectorAll('h2, h3, p, div, span').forEach(title => {
+      if (title.childElementCount !== 0 || title.textContent.trim() !== '戰報' || title.closest('[data-mdp-bar]')) return;
+      for (let s = title.nextElementSibling; s; s = s.nextElementSibling) {
+        if (OUTCOME_RE.test(s.textContent.trim())) s.setAttribute('data-mdp-hide', '');   // 只蓋勝負／死亡標籤，不動其他內容
+      }
     });
   }
   // 事件遭遇戰：事件結算視窗會直接寫「遭遇戰鬥！ (勝利／失敗／平手)」，逐行模式下一律改成不寫結果
@@ -75,13 +89,14 @@
   function announce(playing) {
     try {
       const de = document.documentElement;
-      if (playing) de.setAttribute('data-mdp-playing', '1');
+      if (playing) { ensureStyle(); de.setAttribute('data-mdp-playing', '1'); }
       else de.removeAttribute('data-mdp-playing');
       de.removeAttribute('data-mdp-progress');
       window.dispatchEvent(new CustomEvent('mdp-playback', { detail: { playing: !!playing } }));
     } catch (e) {}
   }
   function showOutcome() {
+    if (!guard) document.documentElement.removeAttribute('data-mdp-guard');
     document.querySelectorAll('[data-mdp-hide]').forEach(e => e.removeAttribute('data-mdp-hide'));
     document.querySelectorAll('[data-mdp-gone]').forEach(e => e.removeAttribute('data-mdp-gone'));
   }
@@ -89,8 +104,9 @@
   function armGuard() {
     if (cfg.mode !== 'step') return;
     guard = true; hideOutcome();
+    document.documentElement.setAttribute('data-mdp-guard', '1');
     clearTimeout(guardTimer);
-    guardTimer = setTimeout(() => { guard = false; if (!hiding()) showOutcome(); }, 45000);   // 保險：45 秒沒等到戰報就放掉
+    guardTimer = setTimeout(() => { guard = false; document.documentElement.removeAttribute('data-mdp-guard'); if (!hiding()) showOutcome(); }, 45000);   // 保險：45 秒沒等到戰報就放掉
   }
 
   /* 戰鬥送出時就先蓋住結果：Boss 頁送出挑戰後，隊伍狀態可能比戰報視窗先更新 */
@@ -317,8 +333,10 @@
   let cur = null;            // { box, rows, idx, playing, timer, bar, sig }
   const seen = new WeakMap(); // box → sig，同一份戰報不重播
 
+  const setReveal = on => { try { if (on) document.documentElement.setAttribute('data-mdp-reveal', '1'); else document.documentElement.removeAttribute('data-mdp-reveal'); } catch (e) {} };
   function startPlayback(box) {
     stopPlayback(false);
+    setReveal(false);
     const rows = rowsOf(box);
     if (!rows.length) return;
     cur = { box, rows, idx: 0, playing: true, timer: null, bar: null, sig: sigOf(box) };
@@ -351,6 +369,7 @@
     cur.idx = cur.rows.length;
     cur.playing = false;
     guard = false; clearTimeout(guardTimer);
+    setReveal(true);
     showOutcome();
     announce(false);
     updateBar();
@@ -372,6 +391,7 @@
     cur.rows = rowsOf(cur.box);
     cur.rows.forEach(r => { r.style.display = 'none'; });
     cur.idx = 0; cur.playing = true;
+    setReveal(false);
     hideOutcome();
     announce(true);
     updateBar();
@@ -414,7 +434,19 @@
   /* 有新的戰鬥過程出現就開始播 */
   function scan() {
     try { maskEncounter(); } catch (e) {}
-    if (!routeOk()) { if (cur) stopPlayback(true); guard = false; return; }
+    try {
+      ensureStyle();
+      document.documentElement.classList.toggle('mdp-step', cfg.mode === 'step');
+      // 標記「戰報」視窗（標題文字是「戰報」），CSS 只蓋這種視窗的標籤
+      document.querySelectorAll('[role="dialog"] h2, [role="alertdialog"] h2, [data-part="title"]').forEach(t => {
+        if (t.textContent.trim() !== '戰報') return;
+        const d = t.closest('[role="dialog"], [role="alertdialog"], [data-scope="dialog"][data-part="content"]') || (t.matches('[data-part="title"]') ? t.parentElement : null);
+        if (d && !d.hasAttribute('data-mdp-report')) d.setAttribute('data-mdp-report', '');
+      });
+      // 戰報視窗都關了：下一次打開的視窗要重新蓋住
+      if (!cur && !findLogBoxes().length) setReveal(false);
+    } catch (e) {}
+    if (!routeOk()) { if (cur) stopPlayback(true); guard = false; document.documentElement.removeAttribute('data-mdp-guard'); return; }
     if (cur && !cur.box.isConnected) stopPlayback(false);
     if (cur && cur.box.isConnected && cur.playing) {
       const s = sigOf(cur.box);
