@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報統計面板
 // @namespace    mydoujin-battle-stats
-// @version      1.20.1
+// @version      1.21.0
 // @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -29,6 +29,7 @@
     view: load('view', 'detail'),       // simple = 簡易（總計／承受／回血），detail = 詳細（全部欄位＋點開細項）
     hidden: false,
     pos: load('pos', null),
+    size: load('size', null),          // 手動拖曳的大小 {w, h}；null＝預設大小＋自動縮放
     open: {},
   };
 
@@ -82,11 +83,15 @@
   /* ---------- 統計 ---------- */
   function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 
+  // 名字前面帶一整句台詞的（「一隻小小的白鳥從收容單元的門縫裡鑽了出來。懲戒鳥」）只留句號後面的名字；完整名字放在滑鼠提示
+  const shortName = n => { const s2 = String(n || '').split(/[。！？!?]/).map(x => x.trim()).filter(Boolean); return s2.length ? s2[s2.length - 1] : String(n || ''); };
   function newUnit(p, side) {
+    const full = p.characterName || p.name || '?';
     return {
       id: p.userId || p.entityId || p._id || p.name,
       side,
-      name: p.characterName || p.name || '?',
+      name: shortName(full),
+      full,
       names: [p.characterName, p.name].filter(Boolean),
       sub: p.characterName ? p.name : (p.title || ''),
       isAssist: !!p.isAssist,
@@ -160,7 +165,7 @@
       const nm = (mn && mn[1]) || ((owner ? owner.name : '') + '的分身') || String(l.targetId);
       let u = byId.get(l.targetId);
       if (!u) { u = newUnit({ name: nm }, owner ? owner.side : 'C'); u.id = l.targetId; units.push(u); byId.set(l.targetId, u); }
-      u.name = nm; u.names = [nm];
+      u.name = shortName(nm); u.full = nm; u.names = [nm];
       if (owner) u.side = owner.side;
       u.isSummon = true;
       u.ownerId = l.actorId;
@@ -452,6 +457,10 @@
     border: 1px solid #34405a; border-radius: 14px;
     box-shadow: 0 18px 48px rgba(0,0,0,.6), 0 0 0 1px rgba(79,209,197,.06) inset; font: 14px/1.5 "Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; overflow: hidden; }
   .panel.simple { width: 640px; }
+  .rz { position: absolute; right: 0; bottom: 0; width: 18px; height: 18px; cursor: nwse-resize; z-index: 3; touch-action: none;
+    background: linear-gradient(135deg, transparent 0 45%, #4FD1C5 45% 52%, transparent 52% 64%, #4FD1C5 64% 71%, transparent 71%); opacity: .55; }
+  .rz:hover { opacity: 1; }
+  .panel.sized { max-width: calc(100vw - 8px); }
   .hd { display: flex; align-items: center; gap: 10px; padding: 10px 12px 10px 14px; background: linear-gradient(180deg,#222b3d,#1a2131);
     border-bottom: 1px solid #2d3748; cursor: move; user-select: none; position: relative; }
   .hd::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: linear-gradient(180deg,#4FD1C5,#2c7a7b); }
@@ -505,6 +514,8 @@
   .side.sB .side-hd .dot { background: #f56565; box-shadow: 0 0 6px rgba(245,101,101,.6); }
   .side.sC .side-hd .dot { background: #a0aec0; box-shadow: none; }
   table.simple td.nm { min-width: 0; }
+  td.nm { white-space: normal; overflow-wrap: anywhere; min-width: 150px; max-width: 280px; }
+  td.nm .tag { white-space: nowrap; }
   table.simple .bar { height: 6px; }
   .sm-line { display: flex; gap: 12px; margin-top: 6px; font-size: 12.5px; color: #8b98ad; }
   .sm-line b { font-variant-numeric: tabular-nums; margin-left: 3px; }
@@ -623,6 +634,7 @@
     document.body.appendChild(host);
     root.addEventListener('click', onClick);
     root.addEventListener('pointerdown', onDragStart);
+    root.addEventListener('dblclick', e => { if (e.target.closest('[data-rz]')) { state.size = null; save('size', null); render(); } });
   }
   function unmount() { if (host) { host.remove(); host = null; root = null; } }
 
@@ -712,7 +724,7 @@
     const { tags, subline } = unitHead(u);
     const bst = u.isBoss && u.stats ? `<tr class="bst" data-key="${esc(key)}"><td colspan="8">${esc(statLine(u.stats))}</td></tr>` : '';
     let html = `<tr class="u${bst ? ' hasbst' : ''}${state.open[key] ? ' open' : ''}" data-key="${esc(key)}">
-      <td class="nm"><span class="arw">${state.open[key] ? '▾' : '▸'}</span>${rkBadge(i)}${esc(u.name)}${tags}<small>${esc(subline)}</small></td>
+      <td class="nm"><span class="arw">${state.open[key] ? '▾' : '▸'}</span>${rkBadge(i)}${nmTxt(u)}${tags}<small>${esc(subline)}</small></td>
       ${cell(dmg, 'c-dmg')}${cell(u.luck, 'c-luck')}
       <td class="c-tot${tot ? '' : ' zero'}">${fmt(tot)} <span class="pct">${pct.toFixed(1)}%</span><div class="bar"><i style="width:${Math.min(100, pct).toFixed(1)}%"></i></div></td>
       ${cell(take, 'c-take')}${cell(u.heal, 'c-heal')}${cell(u.sp, 'c-sp')}${critCell(u.crit, u.hitN)}
@@ -730,7 +742,7 @@
     const st = (label, v, cls) => `<div class="cs ${cls}${v ? '' : ' zero'}"><span>${label}</span><b>${fmt(v)}</b></div>`;
     return `<div class="card${open ? ' open' : ''}" data-key="${esc(key)}">
       <div class="c-top">
-        <div class="c-nm">${rkBadge(i)}<b>${esc(u.name)}</b>${tags}${subline ? `<small>${esc(subline)}</small>` : ''}</div>
+        <div class="c-nm">${rkBadge(i)}<b>${nmTxt(u)}</b>${tags}${subline ? `<small>${esc(subline)}</small>` : ''}</div>
         <div class="c-big${tot ? '' : ' zero'}"><b>${fmt(tot)}</b><span>${pct.toFixed(1)}%</span></div>
       </div>
       <div class="bar"><i style="width:${Math.min(100, pct).toFixed(1)}%"></i></div>
@@ -790,6 +802,7 @@
   }
 
   // 簡易模式：只看名次、總計傷害（佔比）、承受、回血、爆擊率；不展開細項
+  const nmTxt = u => u.full && u.full !== u.name ? `<span title="${esc(u.full)}">${esc(u.name)}</span>` : esc(u.name);
   const simpleTags = u => (u.dead ? '<span class="tag dead">倒下</span>' : '') + (u.isAssist ? '<span class="tag ast">支援</span>' : '') + (u.isSummon ? '<span class="tag sum">分身</span>' : '');
   function sideSimple(rep, units, side, mode, mob) {
     const list = units.filter(u => u.side === side);
@@ -801,7 +814,7 @@
     if (mob) {
       return `<div class="side s${side}">${head}${list.map((u, i) => {
         const tot = u.dealt[mode] + u.luck, p = pctOf(u);
-        return `<div class="card simple"><div class="c-top"><div class="c-nm">${rkBadge(i)}<b>${esc(u.name)}</b>${simpleTags(u)}</div>
+        return `<div class="card simple"><div class="c-top"><div class="c-nm">${rkBadge(i)}<b>${nmTxt(u)}</b>${simpleTags(u)}</div>
           <div class="c-big${tot ? '' : ' zero'}"><b>${fmt(tot)}</b><span>${p.toFixed(1)}%</span></div></div>
           <div class="bar"><i style="width:${Math.min(100, p).toFixed(1)}%"></i></div>
           <div class="sm-line"><span>承受<b class="c-take">${fmt(u.taken[mode])}</b></span>${u.heal ? `<span>回血<b class="c-heal">${fmt(u.heal)}</b></span>` : ''}<span>爆擊<b class="c-crit">${critPct(u.crit, u.hitN)}</b> <i style="font-style:normal;font-size:11px">${u.crit}/${u.hitN}</i></span></div></div>`;
@@ -811,7 +824,7 @@
       <table class="simple"><thead><tr><th>角色</th><th>總計傷害</th><th>承受傷害</th><th>回復血量</th><th>爆擊率</th></tr></thead><tbody>
       ${list.map((u, i) => {
         const tot = u.dealt[mode] + u.luck, p = pctOf(u);
-        return `<tr class="u0"><td class="nm">${rkBadge(i)}${esc(u.name)}${simpleTags(u)}</td>
+        return `<tr class="u0"><td class="nm">${rkBadge(i)}${nmTxt(u)}${simpleTags(u)}</td>
           <td class="c-tot${tot ? '' : ' zero'}" style="min-width:190px">${fmt(tot)} <span class="pct">${p.toFixed(1)}%</span><div class="bar"><i style="width:${Math.min(100, p).toFixed(1)}%"></i></div></td>
           ${cell(u.taken[mode], 'c-take')}${cell(u.heal, 'c-heal')}${critCell(u.crit, u.hitN)}</tr>`;
       }).join('')}
@@ -946,8 +959,10 @@
       body = `<div class="msg">${esc(statusText || '等待戰報資料…')}</div>`;
     }
     const col = state.collapsed;
+    const sz = !mob && state.size ? state.size : null;
+    const szStyle = sz ? `width:${sz.w}px;` + (col ? '' : `height:${sz.h}px;`) : '';
     root.innerHTML = `<style>${CSS}</style>
-      <div class="panel${mob ? ' mob' : ''}${col ? ' col' : ''}${simple && !mob ? ' simple' : ''}" style="${posStyle}">
+      <div class="panel${mob ? ' mob' : ''}${col ? ' col' : ''}${simple && !mob ? ' simple' : ''}${sz ? ' sized' : ''}" style="${posStyle}${szStyle}">
         <div class="hd"${mob ? ' data-act="collapse"' : ' data-drag="1"'}>
           ${mob ? '<span class="grab"></span>' : ''}
           <div class="ttlw"><span class="ttl">📊 戰報統計</span>${col ? (playing ? `<span class="chips"><span class="chip play">⏳ 播放中</span></span>` : '') : `<span class="chips">${sub}</span>`}</div>
@@ -958,6 +973,7 @@
           </div>
         </div>
         ${col ? '' : `<div class="bd">${body}</div>`}
+        ${col || mob ? '' : '<div class="rz" data-rz="1" title="拖曳調整大小（雙擊恢復預設大小）"></div>'}
       </div>`;
     applyFit();
   }
@@ -971,6 +987,11 @@
     const mob = narrow();
     const top = p.getBoundingClientRect().top;
     const avail = Math.max(200, window.innerHeight - top - 12);
+    if (!mob && state.size && !state.collapsed) {
+      p.style.height = Math.min(state.size.h, avail) + 'px';
+      if (lab) lab.textContent = '手動';
+      return;
+    }
     if (mob || state.collapsed || !state.fit || !cache.get(currentId) || document.documentElement.hasAttribute('data-mdp-playing')) {
       if (!mob) p.style.maxHeight = avail + 'px';      // 不縮放時也不要超出視窗底部
       if (lab) lab.textContent = state.fit ? '100%' : '關';
@@ -993,7 +1014,7 @@
     if (btn) {
       const act = btn.dataset.act;
       if (act === 'side') { state.sideView = btn.dataset.s || 'all'; render(); }
-      else if (act === 'fit') { state.fit = !state.fit; save('fit', state.fit); render(); }
+      else if (act === 'fit') { if (state.size) { state.size = null; save('size', null); state.fit = true; } else state.fit = !state.fit; save('fit', state.fit); render(); }
       else if (act === 'view') { state.view = btn.dataset.v === 'simple' ? 'simple' : 'detail'; save('view', state.view); render(); }
       else if (act === 'collapse') { if (e.target.closest('button') && e.target.closest('button') !== btn) return; state.collapsed = !state.collapsed; save('collapsed', state.collapsed); render(); }
       else if (act === 'hide') { state.hidden = true; render(); }
@@ -1005,6 +1026,7 @@
   }
 
   function onDragStart(e) {
+    if (e.target.closest('[data-rz]')) { onResizeStart(e); return; }
     const hd = e.target.closest('[data-drag]');
     if (!hd || e.target.closest('button')) return;
     const panel = hd.parentElement;
@@ -1019,6 +1041,31 @@
       state.pos = { left: Math.round(left), top: Math.round(top) };
     };
     const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); if (state.pos) save('pos', state.pos); applyFit(); };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    e.preventDefault();
+  }
+
+  // 右下角拖曳調整大小（展開時才有）；大小會記住，雙擊恢復預設
+  function onResizeStart(e) {
+    const panel = e.target.closest('.panel');
+    if (!panel) return;
+    const r = panel.getBoundingClientRect();
+    panel.style.transform = ''; panel.style.maxHeight = 'none';
+    panel.style.left = r.left + 'px'; panel.style.top = r.top + 'px'; panel.style.right = 'auto';
+    state.pos = { left: Math.round(r.left), top: Math.round(r.top) };
+    const sx = e.clientX, sy = e.clientY, w0 = r.width, h0 = r.height;
+    const move = ev => {
+      const w = Math.max(360, Math.min(window.innerWidth - r.left - 4, w0 + ev.clientX - sx));
+      const h = Math.max(160, Math.min(window.innerHeight - r.top - 4, h0 + ev.clientY - sy));
+      panel.style.width = w + 'px'; panel.style.height = h + 'px';
+      state.size = { w: Math.round(w), h: Math.round(h) };
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up);
+      save('pos', state.pos);
+      if (state.size) { save('size', state.size); render(); }
+    };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
     e.preventDefault();
