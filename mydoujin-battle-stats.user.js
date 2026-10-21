@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報統計面板
 // @namespace    mydoujin-battle-stats
-// @version      1.18.2
+// @version      1.18.4
 // @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -480,6 +480,13 @@
   .panel.dense .tile { padding: 3px 8px 4px; }
   .panel.dense .side { margin-bottom: 10px; }
   .panel.dense .nm small { display: inline; margin-left: 8px; }
+  .playing { padding: 28px 12px 30px; text-align: center; color: #a8b4c8; }
+  .playing .pi { font-size: 30px; animation: mdbsPulse 1.6s ease-in-out infinite; }
+  .playing .pt { margin-top: 6px; font-size: 15px; font-weight: 700; color: #e2e8f0; }
+  .playing .pt b { margin-left: 8px; color: #4FD1C5; font-variant-numeric: tabular-nums; }
+  .playing .ps { margin-top: 4px; font-size: 12.5px; }
+  .chip.play { background: rgba(79,209,197,.12); color: #81e6d9; border-color: rgba(79,209,197,.4); }
+  @keyframes mdbsPulse { 0%,100% { opacity: .45; } 50% { opacity: 1; } }
   .sumbar { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 6px; margin: 0 0 10px; }
   .tile { background: linear-gradient(180deg,#212a3b,#1b2232); border: 1px solid #2d3748; border-radius: 8px; padding: 4px 9px 5px; min-width: 0; }
   .tile .top { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; min-width: 0; }
@@ -900,20 +907,25 @@
     const posStyle = mob ? '' : pos
       ? `left:${Math.max(0, Math.min(pos.left, document.documentElement.clientWidth - 160))}px;top:${Math.max(0, Math.min(pos.top, document.documentElement.clientHeight - 40))}px;`
       : 'right:16px;top:72px;';
+    const playing = document.documentElement.hasAttribute('data-mdp-playing');
     if (state.hidden) {
-      root.innerHTML = `<style>${CSS}</style><button class="fab${mob ? ' m' : ''}" data-act="show">📊 戰報統計</button>`;
+      root.innerHTML = `<style>${CSS}</style><button class="fab${mob ? ' m' : ''}" data-act="show">📊 戰報統計${playing ? '・⏳ 播放中' : ''}</button>`;
       return;
     }
     const rep = cache.get(currentId);
     const mode = state.mode;
     let sub = `<span class="chip">#${esc(currentId)}</span>`, body;
     const simple = state.view === 'simple';
-    if (rep) {
+    if (rep && playing) {
+      // 逐行播放中：數字全部先不顯示，播完才出現
+      sub = `<span class="chip play">⏳ 播放中</span>` + (rep.battleType ? `<span class="chip">${esc(rep.battleType)}</span>` : '') + `<span class="chip">#${esc(currentId)}</span>`;
+      body = `<div class="playing"><div class="pi">⏳</div><div class="pt">戰報逐行播放中</div>
+        <div class="ps">播完最後一行才顯示傷害、MVP 與勝負</div></div>`;
+    } else if (rep) {
       const units = analyze(rep);
       const t = rep.createdAt ? new Date(rep.createdAt).toLocaleString() : '';
       const rc = { WIN: 'win', LOSE: 'lose', DRAW: 'draw' }[rep.result] || '';
       // 戰報逐行播放還在播時，先不顯示勝負（播完才揭曉）
-      const playing = document.documentElement.hasAttribute('data-mdp-playing');
       sub = (playing ? `<span class="chip" title="逐行播放完才顯示勝負">⏳ 播放中</span>` : rep.result ? `<span class="chip ${rc}">${esc(RESULT[rep.result] || rep.result)}</span>` : '') +
         (rep.battleType ? `<span class="chip">${esc(rep.battleType)}</span>` : '') +
         `<span class="chip">#${esc(currentId)}</span>` + (t ? `<span class="chip">${esc(t)}</span>` : '');
@@ -940,7 +952,7 @@
       <div class="panel${mob ? ' mob' : ''}${col ? ' col' : ''}${simple && !mob ? ' simple' : ''}" style="${posStyle}">
         <div class="hd"${mob ? ' data-act="collapse"' : ' data-drag="1"'}>
           ${mob ? '<span class="grab"></span>' : ''}
-          <div class="ttlw"><span class="ttl">📊 戰報統計</span>${col ? '' : `<span class="chips">${sub}</span>`}</div>
+          <div class="ttlw"><span class="ttl">📊 戰報統計</span>${col ? (playing ? `<span class="chips"><span class="chip play">⏳ 播放中</span></span>` : '') : `<span class="chips">${sub}</span>`}</div>
           <div class="tools">
             ${col ? '' : `<span class="seg"><button data-act="view" data-v="simple" class="${simple ? 'on' : ''}" title="只看總計傷害、承受、回血">簡易</button><button data-act="view" data-v="detail" class="${simple ? '' : 'on'}" title="全部欄位，點角色看細項">詳細</button></span>`}
             <button data-act="collapse" class="ib" title="${col ? '展開' : '收合'}">${col ? (mob ? '▴' : '＋') : (mob ? '▾' : '－')}</button>
@@ -961,7 +973,7 @@
     const mob = narrow();
     const top = p.getBoundingClientRect().top;
     const avail = Math.max(200, window.innerHeight - top - 12);
-    if (mob || state.collapsed || !state.fit || !cache.get(currentId)) {
+    if (mob || state.collapsed || !state.fit || !cache.get(currentId) || document.documentElement.hasAttribute('data-mdp-playing')) {
       if (!mob) p.style.maxHeight = avail + 'px';      // 不縮放時也不要超出視窗底部
       if (lab) lab.textContent = state.fit ? '100%' : '關';
       return;

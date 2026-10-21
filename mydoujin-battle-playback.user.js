@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報逐行播放
 // @namespace    mydoujin-battle-playback
-// @version      1.2.0
+// @version      1.2.2
 // @description  Boss 挑戰、玩家切磋／茶渡、事件遭遇戰、戰報頁回放：戰鬥過程一行一行出現，勝負、死亡標記與死亡橫幅等到最後一行才揭曉。可調每行間隔，或切回直接顯示結果；每一行後面顯示被打／被補的人剩多少血
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -74,8 +74,10 @@
   // 讓其他腳本（戰報統計）知道正在逐行播放，播完前不要顯示勝負
   function announce(playing) {
     try {
-      if (playing) document.documentElement.setAttribute('data-mdp-playing', '1');
-      else document.documentElement.removeAttribute('data-mdp-playing');
+      const de = document.documentElement;
+      if (playing) de.setAttribute('data-mdp-playing', '1');
+      else de.removeAttribute('data-mdp-playing');
+      de.removeAttribute('data-mdp-progress');
       window.dispatchEvent(new CustomEvent('mdp-playback', { detail: { playing: !!playing } }));
     } catch (e) {}
   }
@@ -405,7 +407,7 @@
     if (!cur || !cur.bar) return;
     const n = cur.rows.length;
     cur.bar.__sr.innerHTML = `<style>${BAR_CSS}</style><div class="b">` + (cur.playing
-      ? `<span>▶ 播放中 ${Math.min(cur.idx, n)} / ${n}</span><span class="dim">每行 ${clampSec(cfg.sec)} 秒</span><span class="sp"></span><button data-a="skip">跳過，直接看結果</button>`
+      ? `<span>▶ 播放中・第 ${Math.min(cur.idx, n)} 行</span><span class="dim">每行 ${clampSec(cfg.sec)} 秒</span><span class="sp"></span><button data-a="skip">跳過，直接看結果</button>`
       : `<span>✔ 播放完畢（共 ${n} 行）</span><span class="sp"></span><button data-a="replay">重播</button>`) + `</div>`;
   }
 
