@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報統計面板
 // @namespace    mydoujin-battle-stats
-// @version      1.14.0
+// @version      1.18.1
 // @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -22,6 +22,9 @@
   const state = {
     mode: 'shown',                     // 固定用戰報文字上的數字（已移除「實際扣血」切換）
     collapsed: load('collapsed', false),
+    fit: load('fit', true),            // 自動縮放：整個面板縮到一個視窗看得完
+    sideView: 'all',                   // 顯示哪一邊：all／A（玩家）／B（BOSS／對手）／C（其他）
+    view: load('view', 'detail'),       // simple = 簡易（總計／承受／回血），detail = 詳細（全部欄位＋點開細項）
     hidden: false,
     pos: load('pos', null),
     open: {},
@@ -96,7 +99,7 @@
       byKind: { normal: { real: 0, shown: 0, n: 0 }, skill: { real: 0, shown: 0, n: 0 }, counter: { real: 0, shown: 0, n: 0 }, dot: { real: 0, shown: 0, n: 0 }, passive: { real: 0, shown: 0, n: 0 }, fart: { real: 0, shown: 0, n: 0 } },
       simmer: null,   // 西米（死靈廚師）專屬：番茄湯、臭臭茶放屁、回收桶
       luck: 0, luckN: 0, luckTaken: 0, luckTakenN: 0,
-      heal: 0, healRecv: 0, sp: 0, spRecv: 0,
+      heal: 0, healTeam: 0, healSolo: 0, selfHeal: {}, healRecv: 0, sp: 0, spRecv: 0,   // healTeam＝治療技能（補隊友、或能補隊友的技能補到自己）、healSolo＝只能補自己（吸血、自補）
       crit: 0, hitN: 0, blockedN: 0, maxHit: 0, missN: 0, dodgeN: 0,
       hpLeft: null, hpMax: null, dead: false,
       burn: 0, burnN: 0,
@@ -125,6 +128,10 @@
     return s.replace(/\d+/g, '#').trim();
   }
 
+  // 會補隊友的治療技能（就算這次剛好補到自己也算治療技能）：希露菲治癒魔術／無詠唱治癒、西米料理、回收桶；
+  // 其他技能只要同一場有補過別人也會自動算進來（例如酷拉皮卡治癒之鎖、同人的小黃金樹、緊急包紮）
+  const TEAM_HEAL_SKILLS = ['sylphy_healing', 'sylphy_chantless_healing', 'simmer_cook', 'simmer_recycle_bin'];
+  const TEAM_HEAL_MSG = /治癒之鎖|治癒魔術|小黃金樹|緊急包紮|番茄湯/;
   function analyze(rep) {
     const P = rep.participants || {};
     const units = [];
@@ -281,6 +288,7 @@
             const cook = soupOwner[a.id] || simmerUnit;
             if (cook) {
               cook.heal += v;
+              cook.healTeam += v;   // 番茄湯是補全隊的料理
               const sm = simOf(cook); sm.soupTick += v; sm.soupTickN++;
               if (cook.dead) sm.soupAfterDeath += v;
               const b = (sm.soupBy[a.name] = sm.soupBy[a.name] || { now: 0, tick: 0, n: 0 }); b.tick += v; b.n++;
@@ -376,7 +384,7 @@
             pending[victim.id] = {};
             break;
           }
-          if (a) a.heal += v;
+          if (a) { a.heal += v; if (t && t !== a) a.healTeam += v; else { const k = TEAM_HEAL_MSG.test(String(l.message || '')) ? 'msg:team' : (l.skillId || l.passiveId || 'msg:'); a.selfHeal[k] = (a.selfHeal[k] || 0) + v; } }
           if (t) t.healRecv += v;
           if (a && t && l.skillId === 'simmer_cook' && /番茄湯/.test(lastDish[t.id] || '')) {
             const sm = simOf(a); sm.soupNow += v; sm.soupNowN++;
@@ -394,7 +402,7 @@
           const ms = msg.match(/恢復了\s*(\d+)\s*SP/);
           if (ms && a) { a.sp += num(ms[1]); a.spRecv += num(ms[1]); }
           const mh = msg.match(/恢復了\s*(\d+)\s*HP/);
-          if (mh && a) { a.heal += num(mh[1]); a.healRecv += num(mh[1]); }
+          if (mh && a) { a.heal += num(mh[1]); const k = TEAM_HEAL_MSG.test(msg) ? 'msg:team' : (l.skillId || l.passiveId || 'msg:'); a.selfHeal[k] = (a.selfHeal[k] || 0) + num(mh[1]); a.healRecv += num(mh[1]); }
           // 燒生命上限（例如酷拉皮卡緋紅眼「燃燒掉 174 點生命上限」），整場戰鬥不會回來
           const mb = msg.match(/(?:燃燒掉|燒掉|減少|失去|扣除)了?\s*(\d+)\s*點?生命上限/);
           if (mb && a) { a.burn += num(mb[1]); a.burnN++; }
@@ -421,6 +429,11 @@
           break;
       }
     });
+    // 補到自己的治療：如果同一招在這場有補過別人（或是已知的補師技能），就算治療技能；否則算只能補自己（吸血、自補）
+    const teamSkills = new Set(TEAM_HEAL_SKILLS);
+    logs.forEach(l => { if (l && l.type === 'HEAL' && l.targetId && l.actorId !== l.targetId && (l.skillId || l.passiveId)) teamSkills.add(l.skillId || l.passiveId); });
+    teamSkills.add('msg:team');
+    units.forEach(u => Object.entries(u.selfHeal).forEach(([k, v]) => { if (teamSkills.has(k)) u.healTeam += v; else u.healSolo += v; }));
     return units;
   }
 
@@ -436,10 +449,62 @@
   :host { all: initial; }
   * { box-sizing: border-box; }
   .panel { position: fixed; z-index: 2147483000; width: 940px; max-width: calc(100vw - 32px); max-height: calc(100vh - 24px);
-    display: flex; flex-direction: column; background: #171c27; color: rgba(255,255,255,.88); border: 1px solid #3a4558; border-radius: 12px;
-    box-shadow: 0 14px 40px rgba(0,0,0,.55); font: 14px/1.5 "Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; overflow: hidden; }
-  .hd { display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: linear-gradient(180deg,#1f2636,#191f2c);
-    border-bottom: 1px solid #2d3748; cursor: move; user-select: none; }
+    display: flex; flex-direction: column; background: linear-gradient(180deg,#1a2030 0%,#151a25 100%); color: rgba(255,255,255,.88);
+    border: 1px solid #34405a; border-radius: 14px;
+    box-shadow: 0 18px 48px rgba(0,0,0,.6), 0 0 0 1px rgba(79,209,197,.06) inset; font: 14px/1.5 "Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; overflow: hidden; }
+  .panel.simple { width: 640px; }
+  .hd { display: flex; align-items: center; gap: 10px; padding: 10px 12px 10px 14px; background: linear-gradient(180deg,#222b3d,#1a2131);
+    border-bottom: 1px solid #2d3748; cursor: move; user-select: none; position: relative; }
+  .hd::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: linear-gradient(180deg,#4FD1C5,#2c7a7b); }
+  .chip { display: inline-flex; align-items: center; font-size: 11.5px; line-height: 1; padding: 4px 8px; border-radius: 999px;
+    background: rgba(255,255,255,.06); color: #a8b4c8; border: 1px solid rgba(255,255,255,.08); white-space: nowrap; }
+  .chip.win { background: rgba(72,187,120,.16); color: #8ee6ad; border-color: rgba(72,187,120,.45); font-weight: 700; }
+  .chip.lose { background: rgba(245,101,101,.14); color: #fca5a5; border-color: rgba(245,101,101,.45); font-weight: 700; }
+  .chip.draw { background: rgba(160,174,192,.14); color: #e2e8f0; border-color: rgba(160,174,192,.4); font-weight: 700; }
+  .chips { display: flex; gap: 5px; align-items: center; min-width: 0; overflow: hidden; }
+  .seg { display: inline-flex; padding: 2px; gap: 2px; background: #10141d; border: 1px solid #34405a; border-radius: 8px; }
+  .seg button { border: none; background: transparent; color: #8b98ad; padding: 4px 10px; border-radius: 6px; font-size: 12px; }
+  .seg button:hover { background: rgba(255,255,255,.05); color: #e2e8f0; }
+  .seg button.on { background: linear-gradient(180deg,#2c9a92,#2c7a7b); color: #fff; font-weight: 700; box-shadow: 0 1px 4px rgba(0,0,0,.35); }
+  .tb { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 10px; flex-wrap: wrap; }
+  .tb .lb { color: #8b98ad; font-size: 12px; margin-right: 6px; }
+  .tb .seg button { padding: 3px 10px; }
+  .tb .seg button i { font-style: normal; color: #6b7a92; font-size: 11px; margin-left: 3px; }
+  .tb .seg button.on i { color: rgba(255,255,255,.75); }
+  .fitb { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #a8b4c8; background: #10141d; border: 1px solid #34405a; border-radius: 8px; padding: 4px 10px; }
+  .fitb.on { color: #4FD1C5; border-color: rgba(79,209,197,.55); }
+  .fitb b { font-variant-numeric: tabular-nums; color: inherit; }
+  .panel.dense th, .panel.dense td { padding-top: 4px; padding-bottom: 4px; }
+  .panel.dense .bar { margin-top: 2px; }
+  .panel.dense .sumbar { margin-bottom: 10px; }
+  .panel.dense .tile { padding: 3px 8px 4px; }
+  .panel.dense .side { margin-bottom: 10px; }
+  .panel.dense .nm small { display: inline; margin-left: 8px; }
+  .sumbar { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 6px; margin: 0 0 10px; }
+  .tile { background: linear-gradient(180deg,#212a3b,#1b2232); border: 1px solid #2d3748; border-radius: 8px; padding: 4px 9px 5px; min-width: 0; }
+  .tile .top { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; min-width: 0; }
+  .tile .lb { color: #8b98ad; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .tile .v { color: #fff; font-size: 15px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.3; flex: none; }
+  .tile .who { color: #cbd5e0; font-size: 11.5px; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tile.t-dmg .v { color: #4FD1C5; } .tile.t-take .v { color: #f6878b; } .tile.t-heal .v { color: #7bd5a6; } .tile.t-mvp .v { color: #f6e05e; }
+  .rk { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; font-size: 11px; font-weight: 800;
+    margin-right: 7px; background: #2a3346; color: #a0aec0; vertical-align: 1px; flex: none; }
+  .rk.r1 { background: linear-gradient(180deg,#f6e05e,#d69e2e); color: #3b2a05; }
+  .rk.r2 { background: linear-gradient(180deg,#e2e8f0,#a0aec0); color: #1a202c; }
+  .rk.r3 { background: linear-gradient(180deg,#f6ad55,#c05621); color: #2d1606; }
+  .side.sB .bar i { background: linear-gradient(90deg,#9b2c2c,#f56565); }
+  .side.sB .bar { background: rgba(245,101,101,.13); }
+  .side.sB .c-tot, .side.sB .c-big b { color: #fc8181; }
+  .side-hd .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #4FD1C5; margin-right: 7px; vertical-align: 1px; box-shadow: 0 0 6px rgba(79,209,197,.6); }
+  .side.sB .side-hd .dot { background: #f56565; box-shadow: 0 0 6px rgba(245,101,101,.6); }
+  .side.sC .side-hd .dot { background: #a0aec0; box-shadow: none; }
+  table.simple td.nm { min-width: 0; }
+  table.simple .bar { height: 6px; }
+  .sm-line { display: flex; gap: 12px; margin-top: 6px; font-size: 12.5px; color: #8b98ad; }
+  .sm-line b { font-variant-numeric: tabular-nums; margin-left: 3px; }
+  .card.simple { cursor: default; padding: 9px 11px; }
+  .card.simple .bar { margin: 6px 0 0; }
+  @media (max-width: 760px) { .sumbar { grid-template-columns: repeat(2, minmax(0,1fr)); } }
   .ttlw { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 10px; }
   .ttl { font-weight: 700; color: #fff; white-space: nowrap; letter-spacing: .5px; }
   .sub { color: #8b98ad; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
@@ -452,11 +517,12 @@
   .panel.col .hd { border-bottom: none; }
   .bd { overflow: auto; padding: 10px 12px 14px; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
   .side { margin-bottom: 14px; }
-  .side-hd { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-weight: 700; color: #e2c897; margin: 2px 2px 6px; }
+  .side-hd { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-weight: 700; color: #e9eef6; margin: 2px 2px 7px; font-size: 14.5px; }
   .side-hd span { font-weight: 400; color: #8b98ad; font-size: 12px; text-align: right; }
   table { width: 100%; border-collapse: separate; border-spacing: 0; border: 1px solid #2d3748; border-radius: 8px; overflow: hidden; }
   th, td { padding: 7px 9px; border-bottom: 1px solid rgba(255,255,255,.06); white-space: nowrap; }
-  th { font-size: 12px; font-weight: 600; color: #8b98ad; text-align: right; background: #1f2636; position: sticky; top: 0; }
+  th { font-size: 12px; font-weight: 600; color: #8b98ad; text-align: right; background: #1d2433; position: sticky; top: 0; letter-spacing: .3px; }
+  tbody tr.u:nth-of-type(even) td { background: rgba(255,255,255,.015); }
   th:first-child, td:first-child { text-align: left; }
   td { text-align: right; font-variant-numeric: tabular-nums; }
   tr.u { cursor: pointer; }
@@ -490,7 +556,7 @@
   .c-take { color: #f6878b; } .c-heal { color: #7bd5a6; } .c-sp { color: #90cdf4; }
   .c-crit { color: #f6e05e; font-variant-numeric: tabular-nums; }
   .zero { color: rgba(255,255,255,.25) !important; font-weight: 400 !important; }
-  .bar { height: 4px; border-radius: 2px; background: rgba(79,209,197,.13); margin-top: 3px; overflow: hidden; }
+  .bar { height: 5px; border-radius: 3px; background: rgba(79,209,197,.13); margin-top: 4px; overflow: hidden; }
   .bar i { display: block; height: 100%; background: linear-gradient(90deg,#2c7a7b,#4FD1C5); border-radius: 2px; }
   .pct { font-size: 11px; color: #8b98ad; font-weight: 400; }
   tr.sum td { border-top: 1px solid #3a4558; font-weight: 700; background: rgba(255,255,255,.03); }
@@ -510,12 +576,15 @@
     border-left: none; border-right: none; border-bottom: none; font-size: 14px; padding-bottom: env(safe-area-inset-bottom); }
   .panel.mob .hd { cursor: pointer; position: relative; padding: 14px 12px 10px; }
   .panel.mob .grab { position: absolute; left: 50%; top: 5px; width: 40px; height: 4px; margin-left: -20px; border-radius: 2px; background: #3a4558; }
-  .panel.mob .ttlw { flex-direction: column; gap: 0; align-items: flex-start; }
+  .panel.mob .ttlw { flex-direction: column; gap: 4px; align-items: flex-start; }
+  .panel.mob .chips { flex-wrap: wrap; }
+  .panel.mob .tools .seg button { font-size: 13px; padding: 6px 10px; min-width: 0; height: auto; }
+  .panel.mob .tools { flex-wrap: wrap; justify-content: flex-end; }
   .panel.mob .sub { max-width: 100%; }
   .panel.mob .tools button { font-size: 16px; padding: 6px 12px; min-width: 40px; }
   .panel.mob .tools button.ib { width: 40px; height: 36px; font-size: 17px; }
   .panel.mob .bd { padding: 8px 10px 16px; }
-  .card { background: #1f2636; border: 1px solid #2d3748; border-radius: 10px; padding: 10px 11px; margin-bottom: 8px; cursor: pointer; }
+  .card { background: linear-gradient(180deg,#212a3b,#1c2333); border: 1px solid #2d3748; border-radius: 12px; padding: 10px 11px; margin-bottom: 8px; cursor: pointer; }
   .card.open { border-color: #2c7a7b; }
   .c-top { display: flex; align-items: flex-start; gap: 8px; }
   .c-nm { flex: 1; min-width: 0; }
@@ -621,20 +690,23 @@
         ${item('被攻擊', u.attackedN + ' 下')}
         ${item('幸運觸發', u.luckN + ' 次')}
         ${item('被幸運砸中', u.luckTakenN + ' 次／' + fmt(u.luckTaken))}
+        ${item('治療技能', fmt(u.healTeam))}
+        ${item('只補自己（吸血、自補）', fmt(u.healSolo))}
         ${item('受到治療', fmt(u.healRecv))}
         ${item('獲得 SP', fmt(u.spRecv))}
       </div>${dotList(u.dot, '異常狀態／持續傷害（這個角色造成的）')}${dotList(u.dotTaken, '受到的異常狀態／持續傷害')}${dotList(u.passiveDot, '反傷（這個角色造成的）')}${dotList(u.passiveTaken, '受到的反傷')}${simmerList(u)}${specialList(u)}`;
   }
 
   // 電腦：表格的一列
-  function unitRows(u, sideTot, mode) {
+  const rkBadge = i => `<span class="rk${i < 3 ? ' r' + (i + 1) : ''}">${i + 1}</span>`;
+  function unitRows(u, sideTot, mode, i) {
     const dmg = u.dealt[mode], tot = dmg + u.luck, take = u.taken[mode];
     const pct = sideTot > 0 ? tot / sideTot * 100 : 0;
     const key = u.id;
     const { tags, subline } = unitHead(u);
     const bst = u.isBoss && u.stats ? `<tr class="bst" data-key="${esc(key)}"><td colspan="8">${esc(statLine(u.stats))}</td></tr>` : '';
     let html = `<tr class="u${bst ? ' hasbst' : ''}${state.open[key] ? ' open' : ''}" data-key="${esc(key)}">
-      <td class="nm"><span class="arw">${state.open[key] ? '▾' : '▸'}</span>${esc(u.name)}${tags}<small>${esc(subline)}</small></td>
+      <td class="nm"><span class="arw">${state.open[key] ? '▾' : '▸'}</span>${rkBadge(i)}${esc(u.name)}${tags}<small>${esc(subline)}</small></td>
       ${cell(dmg, 'c-dmg')}${cell(u.luck, 'c-luck')}
       <td class="c-tot${tot ? '' : ' zero'}">${fmt(tot)} <span class="pct">${pct.toFixed(1)}%</span><div class="bar"><i style="width:${Math.min(100, pct).toFixed(1)}%"></i></div></td>
       ${cell(take, 'c-take')}${cell(u.heal, 'c-heal')}${cell(u.sp, 'c-sp')}${critCell(u.crit, u.hitN)}
@@ -644,7 +716,7 @@
   }
 
   // 手機：每個角色一張卡片，主數字放大，其他數字排成格子；點卡片展開細項
-  function unitCard(u, sideTot, mode) {
+  function unitCard(u, sideTot, mode, i) {
     const dmg = u.dealt[mode], tot = dmg + u.luck, take = u.taken[mode];
     const pct = sideTot > 0 ? tot / sideTot * 100 : 0;
     const key = u.id, open = !!state.open[key];
@@ -652,7 +724,7 @@
     const st = (label, v, cls) => `<div class="cs ${cls}${v ? '' : ' zero'}"><span>${label}</span><b>${fmt(v)}</b></div>`;
     return `<div class="card${open ? ' open' : ''}" data-key="${esc(key)}">
       <div class="c-top">
-        <div class="c-nm"><b>${esc(u.name)}</b>${tags}${subline ? `<small>${esc(subline)}</small>` : ''}</div>
+        <div class="c-nm">${rkBadge(i)}<b>${esc(u.name)}</b>${tags}${subline ? `<small>${esc(subline)}</small>` : ''}</div>
         <div class="c-big${tot ? '' : ' zero'}"><b>${fmt(tot)}</b><span>${pct.toFixed(1)}%</span></div>
       </div>
       <div class="bar"><i style="width:${Math.min(100, pct).toFixed(1)}%"></i></div>
@@ -711,6 +783,75 @@
       ent.map(([k, n]) => `<div>・${esc(k.split('〈T〉').join(u.name))}<b>×${n}</b></div>`).join('') + `</div>`;
   }
 
+  // 簡易模式：只看名次、總計傷害（佔比）、承受、回血、爆擊率；不展開細項
+  const simpleTags = u => (u.dead ? '<span class="tag dead">倒下</span>' : '') + (u.isAssist ? '<span class="tag ast">支援</span>' : '') + (u.isSummon ? '<span class="tag sum">分身</span>' : '');
+  function sideSimple(rep, units, side, mode, mob) {
+    const list = units.filter(u => u.side === side);
+    if (!list.length) return '';
+    const S = list.reduce((s, u) => { s.tot += u.dealt[mode] + u.luck; s.take += u.taken[mode]; s.heal += u.heal; s.crit += u.crit; s.hitN += u.hitN; return s; }, { tot: 0, take: 0, heal: 0, crit: 0, hitN: 0 });
+    list.sort((a, b) => (b.dealt[mode] + b.luck) - (a.dealt[mode] + a.luck));
+    const pctOf = u => S.tot > 0 ? (u.dealt[mode] + u.luck) / S.tot * 100 : 0;
+    const head = `<div class="side-hd"><span style="color:inherit;font-size:inherit"><i class="dot"></i>${sideLabel(rep, side)}</span><span>${list.length} 名${list.length > 1 ? `・總計 ${fmt(S.tot)}` : ''}</span></div>`;
+    if (mob) {
+      return `<div class="side s${side}">${head}${list.map((u, i) => {
+        const tot = u.dealt[mode] + u.luck, p = pctOf(u);
+        return `<div class="card simple"><div class="c-top"><div class="c-nm">${rkBadge(i)}<b>${esc(u.name)}</b>${simpleTags(u)}</div>
+          <div class="c-big${tot ? '' : ' zero'}"><b>${fmt(tot)}</b><span>${p.toFixed(1)}%</span></div></div>
+          <div class="bar"><i style="width:${Math.min(100, p).toFixed(1)}%"></i></div>
+          <div class="sm-line"><span>承受<b class="c-take">${fmt(u.taken[mode])}</b></span>${u.heal ? `<span>回血<b class="c-heal">${fmt(u.heal)}</b></span>` : ''}<span>爆擊<b class="c-crit">${critPct(u.crit, u.hitN)}</b> <i style="font-style:normal;font-size:11px">${u.crit}/${u.hitN}</i></span></div></div>`;
+      }).join('')}</div>`;
+    }
+    return `<div class="side s${side}">${head}
+      <table class="simple"><thead><tr><th>角色</th><th>總計傷害</th><th>承受傷害</th><th>回復血量</th><th>爆擊率</th></tr></thead><tbody>
+      ${list.map((u, i) => {
+        const tot = u.dealt[mode] + u.luck, p = pctOf(u);
+        return `<tr class="u0"><td class="nm">${rkBadge(i)}${esc(u.name)}${simpleTags(u)}</td>
+          <td class="c-tot${tot ? '' : ' zero'}" style="min-width:190px">${fmt(tot)} <span class="pct">${p.toFixed(1)}%</span><div class="bar"><i style="width:${Math.min(100, p).toFixed(1)}%"></i></div></td>
+          ${cell(u.taken[mode], 'c-take')}${cell(u.heal, 'c-heal')}${critCell(u.crit, u.hitN)}</tr>`;
+      }).join('')}
+      ${list.length > 1 ? `<tr class="sum"><td>合計</td>${cell(S.tot, 'c-tot')}${cell(S.take, 'c-take')}${cell(S.heal, 'c-heal')}${critCell(S.crit, S.hitN)}</tr>` : ''}
+      </tbody></table></div>`;
+  }
+
+  // 頂部摘要：我方總傷害、MVP（綜合貢獻）、最佳坦克、最佳奶媽
+  // MVP 綜合貢獻＝各項佔全隊比例的加權平均：輸出（含幸運、分身）×1、治療×1、承受傷害×0.5、回 SP×0.5；
+  // 治療＝治療技能全算（能補隊友的招：番茄湯、小黃金樹、緊急包紮、治癒之鎖、治癒魔術…補到自己也算）
+  //      ＋只能補自己的（吸血、自補）只算 20%。
+  // 全隊都是 0 的項目不列入。所有玩家的綜合貢獻加起來是 100%。
+  const MVP_W = [['輸出', 1], ['治療', 1], ['承傷', 0.5], ['回SP', 0.5]];
+  const SELF_HEAL_W = 0.2;
+  function contribution(mine, mode) {
+    const outOf = u => u.dealt[mode] + u.luck + u.summons.reduce((s2, x) => s2 + x.dealt[mode] + x.luck, 0);
+    const vals = u => [outOf(u), u.healTeam + u.healSolo * SELF_HEAL_W, u.taken[mode], u.sp];
+    const tot = [0, 0, 0, 0];
+    mine.forEach(u => vals(u).forEach((v, i) => { tot[i] += v; }));
+    const used = MVP_W.map(([, w], i) => tot[i] > 0 ? w : 0);
+    const wsum = used.reduce((a, b) => a + b, 0) || 1;
+    return mine.map(u => {
+      const v = vals(u), share = v.map((x, i) => tot[i] > 0 ? x / tot[i] : 0);
+      const score = share.reduce((a, x, i) => a + x * used[i], 0) / wsum;
+      return { u, out: v[0], score, parts: MVP_W.map(([n], i) => used[i] && share[i] > 0 ? `${n}${(share[i] * 100).toFixed(0)}%` : '').filter(Boolean) };
+    });
+  }
+  function summaryBar(rep, units, mode) {
+    const mine = units.filter(u => u.side === 'A' && !u.isSummon);
+    if (!mine.length) return '';
+    const top = (arr, f) => arr.reduce((b, u) => (f(u) > f(b) ? u : b), arr[0]);
+    const cs = contribution(mine, mode);
+    const all = cs.reduce((s, c) => s + c.out, 0);
+    const mvp = top(cs, c => c.score), tank = top(mine, u => u.taken[mode]), healer = top(mine, u => u.healTeam);
+    const tile = (cls, lb, v, who, tip) => `<div class="tile ${cls}" title="${esc(tip || who.replace(/<[^>]+>/g, ''))}"><div class="top"><span class="lb">${lb}</span><span class="v">${v}</span></div><div class="who">${who}</div></div>`;
+    const rank = cs.slice().sort((a, b) => b.score - a.score).map(c => `${c.u.name} ${(c.score * 100).toFixed(1)}%（${c.parts.join('、') || '無'}）`).join('\n');
+    return `<div class="sumbar">
+      ${tile('t-dmg', '⚔️ 我方總傷害', fmt(all), mine.length + ' 名玩家')}
+      ${tile('t-mvp', '🏆 MVP', (mvp.score * 100).toFixed(1) + '%', esc(mvp.u.name) + (mvp.parts.length ? '・' + esc(mvp.parts.join(' ')) : ''),
+        '綜合貢獻＝各項佔全隊比例的加權平均：輸出×1、治療×1、承受傷害×0.5、回SP×0.5（全隊都是 0 的項目不算）\n治療＝治療技能全算（能補隊友的招，補到自己也算）＋只能補自己的（吸血、自補）只算 20%\n\n' + rank)}
+      ${tile('t-take', '🛡️ 最佳坦克', fmt(tank.taken[mode]), esc(tank.name))}
+      ${tile('t-heal', '💚 最佳奶媽', healer.healTeam ? fmt(healer.healTeam) : '—', healer.healTeam ? esc(healer.name) : '沒有人用治療技能',
+        '最佳奶媽看「治療技能」的回血：能補隊友的招都算（補到自己也算），吸血、自補不算\n\n' + mine.slice().sort((a, b) => b.healTeam - a.healTeam).map(u => `${u.name}：治療技能 ${fmt(u.healTeam)}、只補自己 ${fmt(u.healSolo)}`).join('\n'))}
+    </div>`;
+  }
+
   function sideTable(rep, units, side, mode) {
     const list = units.filter(u => u.side === side);
     if (!list.length) return '';
@@ -720,12 +861,12 @@
     }, { dmg: 0, luck: 0, take: 0, heal: 0, sp: 0, crit: 0, hitN: 0 });
     const tot = S.dmg + S.luck;
     list.sort((a, b) => (b.dealt[mode] + b.luck) - (a.dealt[mode] + a.luck));
-    return `<div class="side">
-      <div class="side-hd">${sideLabel(rep, side)}<span>${list.length} 名・點角色列看細項</span></div>
+    return `<div class="side s${side}">
+      <div class="side-hd"><span style="color:inherit;font-size:inherit"><i class="dot"></i>${sideLabel(rep, side)}</span><span>${list.length} 名・點角色列看細項</span></div>
       <table><thead><tr>
         <th>角色</th><th>造成傷害</th><th>幸運傷害</th><th>總計傷害</th><th>承受傷害</th><th>回復血量</th><th>回復SP</th><th>爆擊率</th>
       </tr></thead><tbody>
-        ${list.map(u => unitRows(u, tot, mode)).join('')}
+        ${list.map((u, i) => unitRows(u, tot, mode, i)).join('')}
         ${list.length > 1 ? `<tr class="sum"><td>合計</td>${cell(S.dmg, 'c-dmg')}${cell(S.luck, 'c-luck')}${cell(tot, 'c-tot')}${cell(S.take, 'c-take')}${cell(S.heal, 'c-heal')}${cell(S.sp, 'c-sp')}${critCell(S.crit, S.hitN)}</tr>` : ''}
       </tbody></table></div>`;
   }
@@ -737,16 +878,16 @@
       { dmg: 0, luck: 0, take: 0, heal: 0 });
     const tot = S.dmg + S.luck;
     list.sort((a, b) => (b.dealt[mode] + b.luck) - (a.dealt[mode] + a.luck));
-    return `<div class="side">
-      <div class="side-hd">${sideLabel(rep, side)}<span>${list.length} 名${list.length > 1 ? `・總計 ${fmt(tot)}・承受 ${fmt(S.take)}${S.heal ? '・回血 ' + fmt(S.heal) : ''}` : ''}</span></div>
-      ${list.map(u => unitCard(u, tot, mode)).join('')}
+    return `<div class="side s${side}">
+      <div class="side-hd"><span style="color:inherit;font-size:inherit"><i class="dot"></i>${sideLabel(rep, side)}</span><span>${list.length} 名${list.length > 1 ? `・總計 ${fmt(tot)}・承受 ${fmt(S.take)}${S.heal ? '・回血 ' + fmt(S.heal) : ''}` : ''}</span></div>
+      ${list.map((u, i) => unitCard(u, tot, mode, i)).join('')}
     </div>`;
   }
 
   // 窄螢幕（手機直拿）改用卡片＋底部抽屜；轉橫或電腦就回到表格
   const narrow = () => { try { return matchMedia('(max-width: 640px)').matches; } catch (e) { return false; } };
   let wasNarrow = null;
-  window.addEventListener('resize', () => { const n = narrow(); if (n !== wasNarrow && currentId) render(); });
+  window.addEventListener('resize', () => { const n = narrow(); if (n !== wasNarrow && currentId) render(); else applyFit(); });
 
   function render() {
     if (!currentId) return;
@@ -764,13 +905,28 @@
     }
     const rep = cache.get(currentId);
     const mode = state.mode;
-    let sub = '#' + currentId, body;
+    let sub = `<span class="chip">#${esc(currentId)}</span>`, body;
+    const simple = state.view === 'simple';
     if (rep) {
       const units = analyze(rep);
       const t = rep.createdAt ? new Date(rep.createdAt).toLocaleString() : '';
-      sub = `#${currentId}・${rep.battleType || ''}・${RESULT[rep.result] || rep.result || ''}・${t}`;
-      const fn = mob ? sideCards : sideTable;
-      body = fn(rep, units, 'A', mode) + fn(rep, units, 'B', mode) + fn(rep, units, 'C', mode);
+      const rc = { WIN: 'win', LOSE: 'lose', DRAW: 'draw' }[rep.result] || '';
+      sub = (rep.result ? `<span class="chip ${rc}">${esc(RESULT[rep.result] || rep.result)}</span>` : '') +
+        (rep.battleType ? `<span class="chip">${esc(rep.battleType)}</span>` : '') +
+        `<span class="chip">#${esc(currentId)}</span>` + (t ? `<span class="chip">${esc(t)}</span>` : '');
+      const sides = ['A', 'B', 'C'].filter(sd => units.some(u => u.side === sd));
+      if (state.sideView !== 'all' && !sides.includes(state.sideView)) state.sideView = 'all';
+      const cnt = sd => units.filter(u => u.side === sd).length;
+      const sv = state.sideView;
+      const tb = `<div class="tb">
+        <div><span class="lb">顯示</span><span class="seg">
+          <button data-act="side" data-s="all" class="${sv === 'all' ? 'on' : ''}">全部<i>${units.length}</i></button>
+          ${sides.map(sd => `<button data-act="side" data-s="${sd}" class="${sv === sd ? 'on' : ''}">${sideLabel(rep, sd)}<i>${cnt(sd)}</i></button>`).join('')}
+        </span></div>
+        ${mob ? '' : `<button data-act="fit" class="fitb${state.fit ? ' on' : ''}" title="自動縮小整個面板，讓戰報在一個視窗內看完（不用捲動）">⤢ 自動縮放 <b class="fitv">${state.fit ? '' : '關'}</b></button>`}
+      </div>`;
+      body = tb + (sv === 'all' || sv === 'A' ? summaryBar(rep, units, mode) : '') +
+        sides.filter(sd => sv === 'all' || sv === sd).map(sd => simple ? sideSimple(rep, units, sd, mode, mob) : (mob ? sideCards : sideTable)(rep, units, sd, mode)).join('');
     } else if (errors[currentId]) {
       body = `<div class="msg err">${esc(errors[currentId])}</div>`;
     } else {
@@ -778,24 +934,55 @@
     }
     const col = state.collapsed;
     root.innerHTML = `<style>${CSS}</style>
-      <div class="panel${mob ? ' mob' : ''}${col ? ' col' : ''}" style="${posStyle}">
+      <div class="panel${mob ? ' mob' : ''}${col ? ' col' : ''}${simple && !mob ? ' simple' : ''}" style="${posStyle}">
         <div class="hd"${mob ? ' data-act="collapse"' : ' data-drag="1"'}>
           ${mob ? '<span class="grab"></span>' : ''}
-          <div class="ttlw"><span class="ttl">📊 戰報統計</span>${col ? '' : `<span class="sub">${esc(sub)}</span>`}</div>
+          <div class="ttlw"><span class="ttl">📊 戰報統計</span>${col ? '' : `<span class="chips">${sub}</span>`}</div>
           <div class="tools">
+            ${col ? '' : `<span class="seg"><button data-act="view" data-v="simple" class="${simple ? 'on' : ''}" title="只看總計傷害、承受、回血">簡易</button><button data-act="view" data-v="detail" class="${simple ? '' : 'on'}" title="全部欄位，點角色看細項">詳細</button></span>`}
             <button data-act="collapse" class="ib" title="${col ? '展開' : '收合'}">${col ? (mob ? '▴' : '＋') : (mob ? '▾' : '－')}</button>
             <button data-act="hide" class="ib" title="縮成小按鈕">✕</button>
           </div>
         </div>
         ${col ? '' : `<div class="bd">${body}</div>`}
       </div>`;
+    applyFit();
+  }
+
+  // 自動縮放：量出面板完整高度，超過視窗就整個等比縮小（最小 50%，再不夠才捲動）
+  function applyFit() {
+    const p = root && root.querySelector('.panel');
+    if (!p) return;
+    p.style.transform = ''; p.style.maxHeight = ''; p.classList.remove('dense');
+    const lab = root.querySelector('.fitv');
+    const mob = narrow();
+    const top = p.getBoundingClientRect().top;
+    const avail = Math.max(200, window.innerHeight - top - 12);
+    if (mob || state.collapsed || !state.fit || !cache.get(currentId)) {
+      if (!mob) p.style.maxHeight = avail + 'px';      // 不縮放時也不要超出視窗底部
+      if (lab) lab.textContent = state.fit ? '100%' : '關';
+      return;
+    }
+    p.style.maxHeight = 'none';
+    let H = p.offsetHeight;
+    if (H > avail) { p.classList.add('dense'); H = p.offsetHeight; }   // 先把行距收緊，還不夠再縮放
+    let sc = Math.min(1, avail / H);
+    if (sc < 0.5) { sc = 0.5; p.style.maxHeight = Math.floor(avail / sc) + 'px'; }
+    if (sc < 0.999) {
+      p.style.transformOrigin = state.pos ? 'top left' : 'top right';
+      p.style.transform = `scale(${sc.toFixed(3)})`;
+    }
+    if (lab) lab.textContent = Math.round(sc * 100) + '%';
   }
 
   function onClick(e) {
     const btn = e.target.closest('[data-act]');
     if (btn) {
       const act = btn.dataset.act;
-      if (act === 'collapse') { if (e.target.closest('button') && e.target.closest('button') !== btn) return; state.collapsed = !state.collapsed; save('collapsed', state.collapsed); render(); }
+      if (act === 'side') { state.sideView = btn.dataset.s || 'all'; render(); }
+      else if (act === 'fit') { state.fit = !state.fit; save('fit', state.fit); render(); }
+      else if (act === 'view') { state.view = btn.dataset.v === 'simple' ? 'simple' : 'detail'; save('view', state.view); render(); }
+      else if (act === 'collapse') { if (e.target.closest('button') && e.target.closest('button') !== btn) return; state.collapsed = !state.collapsed; save('collapsed', state.collapsed); render(); }
       else if (act === 'hide') { state.hidden = true; render(); }
       else if (act === 'show') { state.hidden = false; render(); }
       return;
@@ -809,6 +996,8 @@
     if (!hd || e.target.closest('button')) return;
     const panel = hd.parentElement;
     const r = panel.getBoundingClientRect();
+    // 縮放時改成以左上角為準，畫面位置不跳動
+    panel.style.transformOrigin = 'top left'; panel.style.left = r.left + 'px'; panel.style.top = r.top + 'px'; panel.style.right = 'auto';
     const dx = e.clientX - r.left, dy = e.clientY - r.top;
     const move = ev => {
       const left = Math.max(0, Math.min(window.innerWidth - 80, ev.clientX - dx));
@@ -816,7 +1005,7 @@
       panel.style.left = left + 'px'; panel.style.top = top + 'px'; panel.style.right = 'auto';
       state.pos = { left: Math.round(left), top: Math.round(top) };
     };
-    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); if (state.pos) save('pos', state.pos); };
+    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); if (state.pos) save('pos', state.pos); applyFit(); };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
     e.preventDefault();
@@ -830,6 +1019,7 @@
     if (id === currentId) return;
     currentId = id;
     state.open = {};
+    state.sideView = 'all';
     if (!id) { unmount(); return; }
     state.hidden = false;
     render();
