@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報統計面板
 // @namespace    mydoujin-battle-stats
-// @version      1.18.1
+// @version      1.18.2
 // @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -887,6 +887,7 @@
   // 窄螢幕（手機直拿）改用卡片＋底部抽屜；轉橫或電腦就回到表格
   const narrow = () => { try { return matchMedia('(max-width: 640px)').matches; } catch (e) { return false; } };
   let wasNarrow = null;
+  window.addEventListener('mdp-playback', () => { if (currentId) render(); });
   window.addEventListener('resize', () => { const n = narrow(); if (n !== wasNarrow && currentId) render(); else applyFit(); });
 
   function render() {
@@ -911,7 +912,9 @@
       const units = analyze(rep);
       const t = rep.createdAt ? new Date(rep.createdAt).toLocaleString() : '';
       const rc = { WIN: 'win', LOSE: 'lose', DRAW: 'draw' }[rep.result] || '';
-      sub = (rep.result ? `<span class="chip ${rc}">${esc(RESULT[rep.result] || rep.result)}</span>` : '') +
+      // 戰報逐行播放還在播時，先不顯示勝負（播完才揭曉）
+      const playing = document.documentElement.hasAttribute('data-mdp-playing');
+      sub = (playing ? `<span class="chip" title="逐行播放完才顯示勝負">⏳ 播放中</span>` : rep.result ? `<span class="chip ${rc}">${esc(RESULT[rep.result] || rep.result)}</span>` : '') +
         (rep.battleType ? `<span class="chip">${esc(rep.battleType)}</span>` : '') +
         `<span class="chip">#${esc(currentId)}</span>` + (t ? `<span class="chip">${esc(t)}</span>` : '');
       const sides = ['A', 'B', 'C'].filter(sd => units.some(u => u.side === sd));

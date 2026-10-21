@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         我的同人｜戰報逐行播放
 // @namespace    mydoujin-battle-playback
-// @version      1.1.0
-// @description  Boss 挑戰、玩家切磋／茶渡、戰報頁回放：戰鬥過程一行一行出現，勝負、死亡標記與死亡橫幅等到最後一行才揭曉。可調每行間隔，或切回直接顯示結果；每一行後面顯示被打／被補的人剩多少血
+// @version      1.2.0
+// @description  Boss 挑戰、玩家切磋／茶渡、事件遭遇戰、戰報頁回放：戰鬥過程一行一行出現，勝負、死亡標記與死亡橫幅等到最後一行才揭曉。可調每行間隔，或切回直接顯示結果；每一行後面顯示被打／被補的人剩多少血
 // @match        https://mydoujin.online/*
 // @run-at       document-start
 // @grant        none
@@ -25,7 +25,8 @@
   cfg.sec = clampSec(cfg.sec);
 
   // 只在這三種頁面作用：Boss、玩家詳情（切磋／茶渡）、單篇戰報
-  const routeOk = () => /^\/(boss|players\/[^/]+|reports\/[^/]+)\/?$/.test(location.pathname);
+  const routeOk = () => /^\/(boss|players\/[^/]+|reports\/[^/]+)?\/?$/.test(location.pathname);
+  const homePage = () => /^\/?$/.test(location.pathname);   // 首頁：事件遭遇戰按「查看戰報」開出來的視窗
 
   /* ---------- 結果遮蔽 ---------- */
   const DEATH_BANNER = '你的角色死亡了，請進行轉生';
@@ -35,7 +36,10 @@
     if (document.getElementById('mdp-style')) return;
     const st = document.createElement('style');
     st.id = 'mdp-style';
-    st.textContent = '[data-mdp-hide]{visibility:hidden !important}[data-mdp-gone]{display:none !important}';
+    st.textContent = '[data-mdp-hide]{visibility:hidden !important}[data-mdp-gone]{display:none !important}' +
+      // 事件視窗的「遭遇戰鬥！ (勝利)」：把原字縮成 0、換成不帶結果的字，顏色也統一（原本勝負用不同顏色）
+      '[data-mdp-enc]{font-size:0 !important;color:#a0aec0 !important}' +
+      '[data-mdp-enc]::after{content:"遭遇戰鬥！（勝負在戰報最後揭曉）";font-size:14px;font-weight:700}';
     (document.head || document.documentElement).appendChild(st);
   }
   function hideOutcome() {
@@ -54,6 +58,26 @@
       let s = title && title.nextElementSibling;
       while (s) { s.setAttribute('data-mdp-hide', ''); s = s.nextElementSibling; }
     });
+  }
+  // 事件遭遇戰：事件結算視窗會直接寫「遭遇戰鬥！ (勝利／失敗／平手)」，逐行模式下一律改成不寫結果
+  const ENC_RE = /^遭遇戰鬥！\s*[(（]\s*(勝利|失敗|平手)\s*[)）]$/;
+  function maskEncounter() {
+    if (cfg.mode !== 'step') {
+      document.querySelectorAll('[data-mdp-enc]').forEach(e => e.removeAttribute('data-mdp-enc'));
+      return;
+    }
+    ensureStyle();
+    document.querySelectorAll('[role="dialog"] p, [role="dialog"] div').forEach(e => {
+      if (e.childElementCount === 0 && !e.hasAttribute('data-mdp-enc') && ENC_RE.test(e.textContent.trim())) e.setAttribute('data-mdp-enc', '');
+    });
+  }
+  // 讓其他腳本（戰報統計）知道正在逐行播放，播完前不要顯示勝負
+  function announce(playing) {
+    try {
+      if (playing) document.documentElement.setAttribute('data-mdp-playing', '1');
+      else document.documentElement.removeAttribute('data-mdp-playing');
+      window.dispatchEvent(new CustomEvent('mdp-playback', { detail: { playing: !!playing } }));
+    } catch (e) {}
   }
   function showOutcome() {
     document.querySelectorAll('[data-mdp-hide]').forEach(e => e.removeAttribute('data-mdp-hide'));
@@ -299,6 +323,7 @@
     seen.set(box, cur.sig);
     rows.forEach(r => { r.style.display = 'none'; });
     hideOutcome();
+    announce(true);
     cur.bar = makeBar(box);
     step();
   }
@@ -325,6 +350,7 @@
     cur.playing = false;
     guard = false; clearTimeout(guardTimer);
     showOutcome();
+    announce(false);
     updateBar();
   }
 
@@ -335,6 +361,7 @@
     if (cur.bar) cur.bar.remove();
     cur = null;
     if (!guard) showOutcome();
+    announce(false);
   }
 
   function replay() {
@@ -344,6 +371,7 @@
     cur.rows.forEach(r => { r.style.display = 'none'; });
     cur.idx = 0; cur.playing = true;
     hideOutcome();
+    announce(true);
     updateBar();
     step();
   }
@@ -383,13 +411,14 @@
 
   /* 有新的戰鬥過程出現就開始播 */
   function scan() {
+    try { maskEncounter(); } catch (e) {}
     if (!routeOk()) { if (cur) stopPlayback(true); guard = false; return; }
     if (cur && !cur.box.isConnected) stopPlayback(false);
     if (cur && cur.box.isConnected && cur.playing) {
       const s = sigOf(cur.box);
       if (s !== cur.sig) startPlayback(cur.box);      // 同一個視窗換成另一場
     }
-    const boxes = findLogBoxes();
+    const boxes = findLogBoxes().filter(b => !homePage() || b.closest('[role="dialog"]'));
     boxes.forEach(box => { try { ensureHp(box); } catch (e) {} });
     boxes.forEach(box => {
       if (cur && cur.box === box) return;
@@ -435,7 +464,7 @@
         <div class="row${step ? '' : ' off'}"><label>每行間隔</label><input id="sec" type="number" min="0.05" max="10" step="0.1" value="${cfg.sec}"${step ? '' : ' disabled'}><span>秒</span></div>
         <div class="row${step ? '' : ' off'}"><input id="follow" type="checkbox"${cfg.follow !== false ? ' checked' : ''}${step ? '' : ' disabled'}><label for="follow">自動捲到最新一行</label></div>
         <div class="row"><input id="hp" type="checkbox"${cfg.hp !== false ? ' checked' : ''}><label for="hp">每一行顯示被打／被補的人剩餘血量</label></div>
-        <div class="hint">播放時「勝利／失敗」「死亡」標籤、頂端死亡橫幅、隊伍成員存活狀態都會先蓋住，最後一行出現才揭曉。</div>
+        <div class="hint">播放時「勝利／失敗／平手」「死亡」標籤、頂端死亡橫幅、隊伍成員存活狀態、事件視窗的「遭遇戰鬥！(結果)」都會先蓋住，最後一行出現才揭曉；戰報統計面板的勝負標籤也會等播完才出現。</div>
       </div>` : '');
     if (popOpen) placePop(sr);
   }
