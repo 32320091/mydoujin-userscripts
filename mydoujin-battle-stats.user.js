@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報統計面板
 // @namespace    mydoujin-battle-stats
-// @version      1.20.0
+// @version      1.20.1
 // @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -11,6 +11,8 @@
 
 (function () {
   'use strict';
+  // 工具箱開關：裝在「我的同人工具箱」裡時可即時開關；單獨安裝時永遠開啟
+  const tk = (typeof TK === 'object' && TK) || { on: true, onToggle() {} };
 
   const API = 'https://mydoujin-backend.onrender.com';
   const cache = new Map();   // reportId -> 戰報 JSON
@@ -20,7 +22,7 @@
   let host = null, root = null;
   let statusText = '';
   const state = {
-    mode: 'shown',                     // 固定用戰報文字上的數字（已移除「實際扣血」切換）
+    mode: 'shown',
     collapsed: load('collapsed', false),
     fit: load('fit', true),            // 自動縮放：整個面板縮到一個視窗看得完
     sideView: 'all',                   // 顯示哪一邊：all／A（玩家）／B（BOSS／對手）／C（其他）
@@ -436,9 +438,6 @@
     units.forEach(u => Object.entries(u.selfHeal).forEach(([k, v]) => { if (teamSkills.has(k)) u.healTeam += v; else u.healSolo += v; }));
     return units;
   }
-
-  /* 舊版累積的傷害樣本與 BOSS 圖鑑已停用，順手把留在 localStorage 的舊資料清掉，釋放空間 */
-  try { ['mdbs:samples', 'mdbs:sampleIds', 'mdbs:bossdex', 'mdbs:bossdexIds'].forEach(k => localStorage.removeItem(k)); } catch (e) {}
 
   /* ---------- UI ---------- */
   const fmt = n => Math.round(n).toLocaleString('en-US');
@@ -897,7 +896,7 @@
   window.addEventListener('resize', () => { const n = narrow(); if (n !== wasNarrow && currentId) render(); else applyFit(); });
 
   function render() {
-    if (!currentId) return;
+    if (!tk.on || !currentId) return;
     mount();
     if (!root) return;
     const mob = narrow();
@@ -1029,6 +1028,7 @@
   function routeId() { const m = location.pathname.match(/^\/reports\/(\d+)\/?$/); return m ? m[1] : null; }
   function onRoute() {
     if (!document.body) return;
+    if (!tk.on) { currentId = null; unmount(); return; }
     const id = routeId();
     if (id === currentId) return;
     currentId = id;
@@ -1046,4 +1046,5 @@
   window.addEventListener('popstate', () => setTimeout(onRoute, 0));
   document.addEventListener('DOMContentLoaded', onRoute);
   setInterval(onRoute, 800);
+  tk.onToggle(() => { currentId = null; onRoute(); });
 })();

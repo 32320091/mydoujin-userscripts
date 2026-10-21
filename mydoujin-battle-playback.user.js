@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報逐行播放
 // @namespace    mydoujin-battle-playback
-// @version      1.2.3
+// @version      1.2.4
 // @description  Boss 挑戰、玩家切磋／茶渡、事件遭遇戰、戰報頁回放：戰鬥過程一行一行出現，勝負、死亡標記與死亡橫幅等到最後一行才揭曉。可調每行間隔，或切回直接顯示結果；每一行後面顯示被打／被補的人剩多少血
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -11,6 +11,8 @@
 
 (function () {
   'use strict';
+  // 工具箱開關：裝在「我的同人工具箱」裡時可即時開關；單獨安裝時永遠開啟
+  const tk = (typeof TK === 'object' && TK) || { on: true, onToggle() {} };
 
   /* 原理：遊戲把整場戰報一次畫好，這支腳本只是先把每一行藏起來、照間隔一行一行放出來，
      同時把「勝利／失敗／平手」「死亡」標籤、頂端「你的角色死亡了」橫幅、隊伍成員的存活狀態
@@ -102,7 +104,7 @@
   }
   const hiding = () => guard || !!(cur && cur.playing);
   function armGuard() {
-    if (cfg.mode !== 'step') return;
+    if (!tk.on || cfg.mode !== 'step') return;
     guard = true; hideOutcome();
     document.documentElement.setAttribute('data-mdp-guard', '1');
     clearTimeout(guardTimer);
@@ -433,6 +435,7 @@
 
   /* 有新的戰鬥過程出現就開始播 */
   function scan() {
+    if (!tk.on) return;
     try { maskEncounter(); } catch (e) {}
     try {
       ensureStyle();
@@ -597,4 +600,19 @@
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
   else start();
+
+  // 工具箱關閉：馬上揭曉、拿掉控制列／設定鈕／血量標籤，恢復遊戲原本的畫面；重新開啟：已經在畫面上的戰報不重播
+  tk.onToggle(on => {
+    const de = document.documentElement;
+    if (on) { findLogBoxes().forEach(b => seen.set(b, sigOf(b))); schedule(); return; }
+    stopPlayback(true);
+    guard = false; clearTimeout(guardTimer);
+    de.removeAttribute('data-mdp-guard'); de.classList.remove('mdp-step'); setReveal(false);
+    showOutcome();
+    document.querySelectorAll('[data-mdp-enc]').forEach(e => e.removeAttribute('data-mdp-enc'));
+    document.querySelectorAll('[data-mdp-report]').forEach(e => e.removeAttribute('data-mdp-report'));
+    findLogBoxes().forEach(b => { clearChips(b); hpState.delete(b); });
+    popOpen = false;
+    hosts.forEach(h => h.remove()); hosts.clear();
+  });
 })();
