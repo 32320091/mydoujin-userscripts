@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報統計面板
 // @namespace    mydoujin-battle-stats
-// @version      1.18.4
+// @version      1.20.0
 // @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -821,16 +821,15 @@
   }
 
   // 頂部摘要：我方總傷害、MVP（綜合貢獻）、最佳坦克、最佳奶媽
-  // MVP 綜合貢獻＝各項佔全隊比例的加權平均：輸出（含幸運、分身）×1、治療×1、承受傷害×0.5、回 SP×0.5；
-  // 治療＝治療技能全算（能補隊友的招：番茄湯、小黃金樹、緊急包紮、治癒之鎖、治癒魔術…補到自己也算）
-  //      ＋只能補自己的（吸血、自補）只算 20%。
+  // MVP 綜合貢獻＝各項佔全隊比例的加權平均，權重：輸出（含幸運、分身）×1 > 補隊友×0.5 > 承受傷害×0.25 = 回 SP×0.25 > 自回×0.1；
+  // 補隊友＝治療技能全算（能補隊友的招：番茄湯、小黃金樹、緊急包紮、治癒之鎖、治癒魔術…補到自己也算）
+  //      自回＝只能補自己的（吸血、自補），單獨一項。
   // 全隊都是 0 的項目不列入。所有玩家的綜合貢獻加起來是 100%。
-  const MVP_W = [['輸出', 1], ['治療', 1], ['承傷', 0.5], ['回SP', 0.5]];
-  const SELF_HEAL_W = 0.2;
+  const MVP_W = [['輸出', 1], ['補隊友', 0.5], ['承傷', 0.25], ['自回', 0.1], ['回SP', 0.25]];
   function contribution(mine, mode) {
     const outOf = u => u.dealt[mode] + u.luck + u.summons.reduce((s2, x) => s2 + x.dealt[mode] + x.luck, 0);
-    const vals = u => [outOf(u), u.healTeam + u.healSolo * SELF_HEAL_W, u.taken[mode], u.sp];
-    const tot = [0, 0, 0, 0];
+    const vals = u => [outOf(u), u.healTeam, u.taken[mode], u.healSolo, u.sp];
+    const tot = MVP_W.map(() => 0);
     mine.forEach(u => vals(u).forEach((v, i) => { tot[i] += v; }));
     const used = MVP_W.map(([, w], i) => tot[i] > 0 ? w : 0);
     const wsum = used.reduce((a, b) => a + b, 0) || 1;
@@ -852,7 +851,7 @@
     return `<div class="sumbar">
       ${tile('t-dmg', '⚔️ 我方總傷害', fmt(all), mine.length + ' 名玩家')}
       ${tile('t-mvp', '🏆 MVP', (mvp.score * 100).toFixed(1) + '%', esc(mvp.u.name) + (mvp.parts.length ? '・' + esc(mvp.parts.join(' ')) : ''),
-        '綜合貢獻＝各項佔全隊比例的加權平均：輸出×1、治療×1、承受傷害×0.5、回SP×0.5（全隊都是 0 的項目不算）\n治療＝治療技能全算（能補隊友的招，補到自己也算）＋只能補自己的（吸血、自補）只算 20%\n\n' + rank)}
+        '綜合貢獻＝各項佔全隊比例的加權平均（全隊都是 0 的項目不算）\n權重：輸出×1 > 補隊友×0.5 > 承受傷害×0.25 = 回SP×0.25 > 自回×0.1\n補隊友＝能補隊友的治療技能（番茄湯、小黃金樹、緊急包紮、治癒之鎖、治癒魔術…補到自己也算）\n自回＝只能補自己的（吸血、自補）\n\n' + rank)}
       ${tile('t-take', '🛡️ 最佳坦克', fmt(tank.taken[mode]), esc(tank.name))}
       ${tile('t-heal', '💚 最佳奶媽', healer.healTeam ? fmt(healer.healTeam) : '—', healer.healTeam ? esc(healer.name) : '沒有人用治療技能',
         '最佳奶媽看「治療技能」的回血：能補隊友的招都算（補到自己也算），吸血、自補不算\n\n' + mine.slice().sort((a, b) => b.healTeam - a.healTeam).map(u => `${u.name}：治療技能 ${fmt(u.healTeam)}、只補自己 ${fmt(u.healSolo)}`).join('\n'))}
