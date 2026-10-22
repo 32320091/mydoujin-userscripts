@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報統計面板
 // @namespace    mydoujin-battle-stats
-// @version      1.21.0
+// @version      1.21.1
 // @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -139,6 +139,46 @@
   // 其他技能只要同一場有補過別人也會自動算進來（例如酷拉皮卡治癒之鎖、同人的小黃金樹、緊急包紮）
   const TEAM_HEAL_SKILLS = ['sylphy_healing', 'sylphy_chantless_healing', 'simmer_cook', 'simmer_recycle_bin'];
   const TEAM_HEAL_MSG = /治癒之鎖|治癒魔術|小黃金樹|緊急包紮|番茄湯/;
+  /* 召喚物名字：召喚訊息的寫法每個角色都不一樣，名字不一定在開頭，例如
+     「玩偶的影子像水一樣漫開，黑色的多臂 月蝕盡絕黑阿修羅 從水面底下慢慢升了起來。」
+     「太歲星君 朝 流螢 的方向抬了抬下巴，十二神將「白虎」化成一頭白色的猛虎…」
+     所以改看「這隻召喚物之後被打／出手／倒下」的紀錄，那些紀錄會用空白把名字夾起來：
+       對 白虎 造成了／白虎 倒下了！／白虎 身上燒出了／被 白虎 躲開了／白虎 直直地衝向…
+     依出現次數投票；都沒有紀錄時才從召喚訊息猜。寶月夜宵的四隻直接比對。 */
+  const KNOWN_SUMMONS = ['邪經文大僧正', '月蝕盡絕黑阿修羅', '魄啜繚亂弟切花魁', '殉國禁獄鬼軍曹'];
+  const PUNCT = /[，。！？、；：,.!?;:「」『』（）()—…]/;
+  const NAME_PATTERNS = [
+    /對\s+(.+?)\s+造成了/, /^\s*(.+?)\s+倒下了/, /^\s*(.+?)\s+身上/, /被\s+(.+?)\s+(?:用\S+)?(?:躲開|閃開|閃過|避開|抵擋)/,
+    /(?:砸向|撞向|斬向|捲到了旁邊的|衝向|往)\s+(.+?)(?:\s+身上|，|！|$)/,
+  ];
+  function summonName(l, logs) {
+    const msg = String(l.message || '').trim();
+    const known = KNOWN_SUMMONS.find(n => msg.includes(n));
+    if (known) return known;
+    const sid = l.targetId;
+    const rel = logs.filter(x => x && x !== l && x.type !== 'SUMMON' && (x.actorId === sid || x.targetId === sid));
+    const vote = new Map();
+    const add = (n, w, min = 2) => { n = String(n || '').trim(); if (n.length >= min && n.length <= 24 && !PUNCT.test(n)) vote.set(n, (vote.get(n) || 0) + w); };
+    // 1) 結構化的句型：被打的時候「對 名字 造成了」最可靠
+    rel.forEach(x => {
+      const m = String(x.message || '');
+      if (x.targetId === sid) NAME_PATTERNS.forEach(re => { const r = m.match(re); if (r) add(r[1], 3, 1); });
+      if (x.actorId === sid) { const r = m.match(/^\s*(\S+(?:\s+T-\d+)?)\s/); if (r) add(r[1], 1); }
+    });
+    // 2) 再不行：統計這些紀錄裡被空白夾住的詞
+    if (!vote.size) rel.forEach(x => String(x.message || '').split(/\s+/).forEach(t => add(t.split(PUNCT)[0], 1)));
+    if (vote.size) {
+      const inMsg = n => msg.includes(n) ? 0.5 : 0;   // 平手時偏好召喚訊息裡也有的名字
+      return [...vote.entries()].sort((p, q) => (q[1] + inMsg(q[0])) - (p[1] + inMsg(p[0])) || p[0].length - q[0].length)[0][0];
+    }
+    // 3) 完全沒有其他紀錄：從召喚訊息猜（「」裡的字 → 被空白夾在中間的詞 → 最後一句）
+    const q = msg.match(/「([^」]{1,16})」/);
+    if (q) return q[1];
+    const toks = msg.split(/\s+/).filter(Boolean);
+    const pick = toks.length >= 3 ? toks[1] : (toks[0] || '');
+    return pick.split(PUNCT).filter(Boolean).pop() || '';
+  }
+
   function analyze(rep) {
     const P = rep.participants || {};
     const units = [];
@@ -161,8 +201,7 @@
     logs.forEach(l => {
       if (!l || l.type !== 'SUMMON' || !l.targetId) return;
       const owner = byId.get(l.actorId);
-      const mn = String(l.message || '').match(/^\s*(\S+?)\s/);
-      const nm = (mn && mn[1]) || ((owner ? owner.name : '') + '的分身') || String(l.targetId);
+      const nm = summonName(l, logs) || ((owner ? owner.name : '') + '的分身') || String(l.targetId);
       let u = byId.get(l.targetId);
       if (!u) { u = newUnit({ name: nm }, owner ? owner.side : 'C'); u.id = l.targetId; units.push(u); byId.set(l.targetId, u); }
       u.name = shortName(nm); u.full = nm; u.names = [nm];
