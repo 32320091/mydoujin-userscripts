@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報統計面板
 // @namespace    mydoujin-battle-stats
-// @version      1.21.1
+// @version      1.22.0
 // @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -192,6 +192,30 @@
       return u;
     };
     const logs = rep.logs || [];
+
+    /* 別人交的資料（遺志）：75F 骸骨獵殺者「接收到來自陌生攻略者的資料」叫出來的援軍，actorId = legacy_xxx，participants 裡沒有。
+       名字取紀錄裡最常出現的「○○的遺志」；原主人從登場文字「懶米的西米」「褪色者的寶月夜宵」抓。
+       另外放一區「遺志」，不算進玩家的 MVP／總傷害。要在召喚物之前登記，遺志叫出來的召喚物才會跟著歸到這一區。 */
+    const legacyIds = [...new Set(logs.flatMap(l => l ? [l.actorId, l.targetId] : []).filter(x => typeof x === 'string' && /^legacy_/.test(x)))];
+    legacyIds.forEach(lid => {
+      const own = logs.filter(l => l && l.actorId === lid);
+      const cnt = new Map();
+      own.forEach(l => {
+        if (/^skull_reaper_|arrive|intercept/.test(l.skillId || '')) return;   // 登場／代擋文字常提到別人的名字，不拿來決定名字
+        const m = String(l.message || '');
+        (m.match(/[^\s，。！？：、「」—]+?的遺志/g) || []).forEach(n => cnt.set(n, (cnt.get(n) || 0) + (m.trim().startsWith(n) ? 3 : 1)));
+      });
+      const name = [...cnt.entries()].sort((p, q) => q[1] - p[1])[0]?.[0] || '陌生攻略者的遺志';
+      const base = name.replace(/的遺志$/, '');
+      const reOwner = new RegExp('([^\\s，。！？：、「」—]+)的' + escRe(base) + '(?!的遺志)');
+      let owner = '';
+      for (const l of own) { const m = String(l.message || '').match(reOwner); if (m && !/遺志$/.test(m[1])) { owner = m[1]; break; } }
+      const u = newUnit({ name }, 'D');
+      u.id = lid; u.isLegacy = true; u.legacyOwner = owner;
+      u.name = owner ? `${base}（${owner}）` : name; u.full = name; u.names = [name];
+      u.sub = owner ? `${owner} 交出的資料` : '陌生攻略者的資料';
+      units.push(u); byId.set(lid, u);
+    });
 
     /* 召喚物：戰報把分身當成獨立行動者（actorId = summon_1），participants 裡沒有它。
        先掃一遍 SUMMON 紀錄，把它登記成召喚者「同陣營」的單位，否則會被丟進「其他」而不計入我方輸出。
@@ -552,6 +576,10 @@
   .side-hd .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #4FD1C5; margin-right: 7px; vertical-align: 1px; box-shadow: 0 0 6px rgba(79,209,197,.6); }
   .side.sB .side-hd .dot { background: #f56565; box-shadow: 0 0 6px rgba(245,101,101,.6); }
   .side.sC .side-hd .dot { background: #a0aec0; box-shadow: none; }
+  .side.sD .side-hd .dot { background: #63b3ed; box-shadow: 0 0 6px rgba(99,179,237,.6); }
+  .side.sD .bar i { background: linear-gradient(90deg,#2b6cb0,#63b3ed); }
+  .side.sD .bar { background: rgba(99,179,237,.13); }
+  .side.sD .c-tot, .side.sD .c-big b { color: #90cdf4; }
   table.simple td.nm { min-width: 0; }
   td.nm { white-space: normal; overflow-wrap: anywhere; min-width: 150px; max-width: 280px; }
   td.nm .tag { white-space: nowrap; }
@@ -597,6 +625,7 @@
   .tag.dot { color: #9ae6b4; border-color: #68d391; }
   .tag.pas { color: #90cdf4; border-color: #63b3ed; }
   .tag.sum { color: #d6bcfa; border-color: #b794f4; }
+  .tag.lgc { color: #90cdf4; border-color: #4299e1; background: rgba(66,153,225,.12); }
   .tag.soup { color: #feb2b2; border-color: #fc8181; }
   .tag.fart { color: #c6f6d5; border-color: #48bb78; background: rgba(72,187,120,.12); }
   .spl .ad { color: #feb2b2; }
@@ -679,6 +708,7 @@
 
   function sideLabel(rep, side) {
     if (side === 'A') return '玩家';
+    if (side === 'D') return '遺志（陌生攻略者的資料）';
     if (side === 'C') return '其他';
     return rep.battleType === 'BOSS' ? 'BOSS' : rep.battleType === 'PVP' ? '對手' : '敵方';
   }
@@ -708,6 +738,7 @@
       (u.simmer && (u.simmer.soupNow + u.simmer.soupTick) ? `<span class="tag soup">番茄湯 +${fmt(u.simmer.soupNow + u.simmer.soupTick)}</span>` : '') +
       (u.simmer && u.simmer.fartN ? `<span class="tag fart">放屁 ${fmt(u.simmer.fart)}</span>` : '') +
       (u.simmer && u.simmer.bin.length ? `<span class="tag soup">回收桶 ×${u.simmer.bin.length}</span>` : '') +
+      (u.isLegacy ? '<span class="tag lgc">遺志</span>' : '') +
       (u.isSummon ? '<span class="tag sum">分身</span>' : '') +
       (u.summonN ? `<span class="tag sum">召喚 ×${u.summonN}</span>` : '');
     const hp = u.hpLeft != null ? `剩餘 HP ${fmt(u.hpLeft)}${u.hpMax ? ' / ' + fmt(u.hpMax) : ''}` : '';
@@ -842,7 +873,7 @@
 
   // 簡易模式：只看名次、總計傷害（佔比）、承受、回血、爆擊率；不展開細項
   const nmTxt = u => u.full && u.full !== u.name ? `<span title="${esc(u.full)}">${esc(u.name)}</span>` : esc(u.name);
-  const simpleTags = u => (u.dead ? '<span class="tag dead">倒下</span>' : '') + (u.isAssist ? '<span class="tag ast">支援</span>' : '') + (u.isSummon ? '<span class="tag sum">分身</span>' : '');
+  const simpleTags = u => (u.dead ? '<span class="tag dead">倒下</span>' : '') + (u.isAssist ? '<span class="tag ast">支援</span>' : '') + (u.isLegacy ? '<span class="tag lgc">遺志</span>' : '') + (u.isSummon ? '<span class="tag sum">分身</span>' : '');
   function sideSimple(rep, units, side, mode, mob) {
     const list = units.filter(u => u.side === side);
     if (!list.length) return '';
@@ -979,7 +1010,7 @@
       sub = (playing ? `<span class="chip" title="逐行播放完才顯示勝負">⏳ 播放中</span>` : rep.result ? `<span class="chip ${rc}">${esc(RESULT[rep.result] || rep.result)}</span>` : '') +
         (rep.battleType ? `<span class="chip">${esc(rep.battleType)}</span>` : '') +
         `<span class="chip">#${esc(currentId)}</span>` + (t ? `<span class="chip">${esc(t)}</span>` : '');
-      const sides = ['A', 'B', 'C'].filter(sd => units.some(u => u.side === sd));
+      const sides = ['A', 'D', 'B', 'C'].filter(sd => units.some(u => u.side === sd));
       if (state.sideView !== 'all' && !sides.includes(state.sideView)) state.sideView = 'all';
       const cnt = sd => units.filter(u => u.side === sd).length;
       const sv = state.sideView;
