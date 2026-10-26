@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         我的同人｜戰報統計面板
 // @namespace    mydoujin-battle-stats
-// @version      1.22.0
+// @version      1.23.0
 // @description  在戰報頁顯示玩家與 BOSS 的造成傷害、幸運傷害、總計傷害、承受傷害、回復血量、回復 SP、每人爆擊率，以及燒掉的生命上限、角色特殊迴避、中毒／出血／凍傷等異常狀態與反傷
 // @match        https://mydoujin.online/*
 // @run-at       document-start
@@ -103,12 +103,13 @@
       mlevel: p.level != null ? p.level : null,
       dealt: { real: 0, shown: 0 },
       taken: { real: 0, shown: 0 },
-      byKind: { normal: { real: 0, shown: 0, n: 0 }, skill: { real: 0, shown: 0, n: 0 }, counter: { real: 0, shown: 0, n: 0 }, dot: { real: 0, shown: 0, n: 0 }, passive: { real: 0, shown: 0, n: 0 }, fart: { real: 0, shown: 0, n: 0 } },
+      byKind: { normal: { real: 0, shown: 0, n: 0 }, skill: { real: 0, shown: 0, n: 0 }, counter: { real: 0, shown: 0, n: 0 }, dot: { real: 0, shown: 0, n: 0 }, passive: { real: 0, shown: 0, n: 0 }, fart: { real: 0, shown: 0, n: 0 }, finale: { real: 0, shown: 0, n: 0 } },
       simmer: null,   // 西米（死靈廚師）專屬：番茄湯、臭臭茶放屁、回收桶
       luck: 0, luckN: 0, luckTaken: 0, luckTakenN: 0,
       heal: 0, healTeam: 0, healSolo: 0, selfHeal: {}, healRecv: 0, sp: 0, spRecv: 0,   // healTeam＝治療技能（補隊友、或能補隊友的技能補到自己）、healSolo＝只能補自己（吸血、自補）
       crit: 0, hitN: 0, blockedN: 0, maxHit: 0, missN: 0, dodgeN: 0,
-      hpLeft: null, hpMax: null, dead: false,
+      hpLeft: null, hpMax: null, dead: false, deathN: 0,
+      revN: 0, revBy: {}, revivedN: 0, finaleBy: {},   // 把倒下的隊友拉起來（例：初音 Chance Time「跟著歌聲重新站了起來」）／自己被拉起來幾次
       burn: 0, burnN: 0,
       attackedN: 0, specialN: 0, special: {},
       dot: {}, dotTaken: {},   // 持續傷害／異常狀態：{ 名稱: { dmg, n, restore, rn } }
@@ -138,6 +139,7 @@
   // 會補隊友的治療技能（就算這次剛好補到自己也算治療技能）：希露菲治癒魔術／無詠唱治癒、西米料理、回收桶；
   // 其他技能只要同一場有補過別人也會自動算進來（例如酷拉皮卡治癒之鎖、同人的小黃金樹、緊急包紮）
   const TEAM_HEAL_SKILLS = ['sylphy_healing', 'sylphy_chantless_healing', 'simmer_cook', 'simmer_recycle_bin'];
+  const REVIVE_MSG = /重新站了起來|復活了|起死回生|甦醒過來/;
   const TEAM_HEAL_MSG = /治癒之鎖|治癒魔術|小黃金樹|緊急包紮|番茄湯/;
   /* 召喚物名字：召喚訊息的寫法每個角色都不一樣，名字不一定在開頭，例如
      「玩偶的影子像水一樣漫開，黑色的多臂 月蝕盡絕黑阿修羅 從水面底下慢慢升了起來。」
@@ -202,6 +204,7 @@
       const cnt = new Map();
       own.forEach(l => {
         if (/^skull_reaper_|arrive|intercept/.test(l.skillId || '')) return;   // 登場／代擋文字常提到別人的名字，不拿來決定名字
+        if (l.targetId && l.targetId !== lid && (/^legacy_/.test(l.targetId) || byId.has(l.targetId) && byId.get(l.targetId).side === 'A')) return;   // 補／加持隊友的文字開頭常是隊友的名字（初音拉人「壺頭哥的遺志 跟著歌聲重新站了起來」）
         const m = String(l.message || '');
         (m.match(/[^\s，。！？：、「」—]+?的遺志/g) || []).forEach(n => cnt.set(n, (cnt.get(n) || 0) + (m.trim().startsWith(n) ? 3 : 1)));
       });
@@ -308,7 +311,7 @@
         const k = a.byKind[kind]; k.real += real; k.shown += shown; k.n++;
         if (CRITABLE[kind]) { a.hitN++; if (l.isCrit) a.crit++; }
         if (l.blocked || l.type === 'BLOCK') a.blockedN++;
-        if (shown > a.maxHit) a.maxHit = shown;
+        if (kind !== 'finale' && shown > a.maxHit) a.maxHit = shown;
       }
       if (t) { t.taken.real += real; t.taken.shown += shown; if (CRITABLE[kind]) t.attackedN++; }
     };
@@ -318,6 +321,15 @@
       const a = get(l.actorId), t = get(l.targetId);
       const v = num(l.value);
       if (a && l.skillId) { const pre = String(l.skillId).split('_')[0]; if (!IGNORE_PREFIX[pre] && !prefixOwner[pre]) prefixOwner[pre] = a; }
+      // 天方夜「全劇終」：場上所有角色倒下 → 對手剩下的血量全部算成天方夜打的
+      if (a && (l.skillId === 'black_tome_final_page' || /寫下「全劇終」/.test(String(l.message || '')))) {
+        units.filter(u => u.side !== a.side && !u.isSummon && !u.isLegacy && num(u.maxHpStat) > 0).forEach(u => {
+          const rem = Math.max(0, num(u.maxHpStat) - u.taken.real + u.healRecv);
+          if (!rem) return;
+          hit(a, u, rem, rem, 'finale', l);
+          a.finaleBy[u.name] = (a.finaleBy[u.name] || 0) + rem;
+        });
+      }
       if (a && l.skillId === 'simmer_cook') {
         simmerUnit = simmerUnit || a;
         const md = String(l.message || '').match(/把一盤\s*(.+?)\s*推到/);
@@ -454,6 +466,11 @@
             pending[victim.id] = {};
             break;
           }
+          // 拉起倒下的隊友：目標已經倒下、或文字寫「重新站了起來／復活」的治療
+          if (t && (t.dead || REVIVE_MSG.test(msg))) {
+            if (a && a !== t) { a.revN++; a.revBy[t.name] = (a.revBy[t.name] || 0) + 1; }
+            t.revivedN++; t.dead = false;
+          }
           if (a) { a.heal += v; if (t && t !== a) a.healTeam += v; else { const k = TEAM_HEAL_MSG.test(String(l.message || '')) ? 'msg:team' : (l.skillId || l.passiveId || 'msg:'); a.selfHeal[k] = (a.selfHeal[k] || 0) + v; } }
           if (t) t.healRecv += v;
           if (a && t && l.skillId === 'simmer_cook' && /番茄湯/.test(lastDish[t.id] || '')) {
@@ -492,7 +509,7 @@
           if (a) a.summonN++;
           break;
         case 'DEATH':
-          if (a) a.dead = true;
+          if (a) { a.dead = true; a.deathN++; }
           break;
         case 'HP_REMAINING':
           if (a) { a.hpLeft = v; a.hpMax = l.maxHp != null ? num(l.maxHp) : null; }
@@ -622,6 +639,10 @@
   .tag.ast { color: #90cdf4; border-color: #90cdf4; }
   .tag.burn { color: #f6ad55; border-color: #f6ad55; }
   .tag.spx { color: #cbd5e0; border-color: #a0aec0; }
+  .tag.rev { color: #fbd38d; border-color: #d69e2e; background: rgba(214,158,46,.12); font-weight: 700; cursor: help; }
+  .tag.rvd { color: #faf089; border-color: #b7791f; }
+  .tag.fin { color: #e9d8fd; border-color: #805ad5; background: rgba(128,90,213,.18); font-weight: 700; cursor: help; }
+  .grid .rev b { color: #fbd38d; }
   .tag.dot { color: #9ae6b4; border-color: #68d391; }
   .tag.pas { color: #90cdf4; border-color: #63b3ed; }
   .tag.sum { color: #d6bcfa; border-color: #b794f4; }
@@ -738,6 +759,7 @@
       (u.simmer && (u.simmer.soupNow + u.simmer.soupTick) ? `<span class="tag soup">番茄湯 +${fmt(u.simmer.soupNow + u.simmer.soupTick)}</span>` : '') +
       (u.simmer && u.simmer.fartN ? `<span class="tag fart">放屁 ${fmt(u.simmer.fart)}</span>` : '') +
       (u.simmer && u.simmer.bin.length ? `<span class="tag soup">回收桶 ×${u.simmer.bin.length}</span>` : '') +
+      revTags(u) +
       (u.isLegacy ? '<span class="tag lgc">遺志</span>' : '') +
       (u.isSummon ? '<span class="tag sum">分身</span>' : '') +
       (u.summonN ? `<span class="tag sum">召喚 ×${u.summonN}</span>` : '');
@@ -764,6 +786,7 @@
         ${item('反擊傷害', fmt(k.counter[mode]) + '（' + k.counter.n + ' 下）')}
         ${k.dot.n ? item('異常狀態傷害', fmt(k.dot[mode]) + '（' + k.dot.n + ' 次）') : ''}
         ${k.passive.n ? item('反傷', fmt(k.passive[mode]) + '（' + k.passive.n + ' 次）') : ''}
+        ${k.finale.n ? item('全劇終（對手剩餘血量）', fmt(k.finale[mode]), 'rev') : ''}
         ${k.fart.n ? item('臭臭茶放屁', fmt(k.fart[mode]) + '（' + k.fart.n + ' 次）', 'fart') : ''}
         ${item('爆擊率', critPct(u.crit, u.hitN) + '（' + u.crit + ' / ' + u.hitN + ' 次判定）')}
         ${u.luk != null ? item('幸運值', u.luk + (u.isSummon ? '（沿用本體，公式推估 ' : '（公式推估 ') + critTheory(u.luk) + '）') : ''}
@@ -780,9 +803,11 @@
         ${item('被幸運砸中', u.luckTakenN + ' 次／' + fmt(u.luckTaken))}
         ${item('治療技能', fmt(u.healTeam))}
         ${item('只補自己（吸血、自補）', fmt(u.healSolo))}
+        ${u.revN ? item('拉起隊友', u.revN + ' 人次（' + Object.keys(u.revBy).length + ' 人）', 'rev') : ''}
+        ${u.deathN ? item('倒下次數', u.deathN + ' 次' + (u.revivedN ? '（被拉起 ' + u.revivedN + ' 次）' : '')) : ''}
         ${item('受到治療', fmt(u.healRecv))}
         ${item('獲得 SP', fmt(u.spRecv))}
-      </div>${dotList(u.dot, '異常狀態／持續傷害（這個角色造成的）')}${dotList(u.dotTaken, '受到的異常狀態／持續傷害')}${dotList(u.passiveDot, '反傷（這個角色造成的）')}${dotList(u.passiveTaken, '受到的反傷')}${simmerList(u)}${specialList(u)}`;
+      </div>${dotList(u.dot, '異常狀態／持續傷害（這個角色造成的）')}${dotList(u.dotTaken, '受到的異常狀態／持續傷害')}${dotList(u.passiveDot, '反傷（這個角色造成的）')}${dotList(u.passiveTaken, '受到的反傷')}${reviveList(u)}${simmerList(u)}${specialList(u)}`;
   }
 
   // 電腦：表格的一列
@@ -871,9 +896,27 @@
       ent.map(([k, n]) => `<div>・${esc(k.split('〈T〉').join(u.name))}<b>×${n}</b></div>`).join('') + `</div>`;
   }
 
+  // 拉人：「拉起 N 人次（M 人）」，滑鼠移上去看拉了誰；被拉起來的人標「被拉起 ×k」
+  function revTags(u) {
+    let h = '';
+    if (u.revN) {
+      const ent = Object.entries(u.revBy).sort((a, b) => b[1] - a[1]);
+      h += `<span class="tag rev" title="${esc('拉起來的隊友：\n' + ent.map(([n, c]) => `${n} ×${c}`).join('\n'))}">拉起 ${u.revN} 人次（${ent.length} 人）</span>`;
+    }
+    if (u.revivedN) h += `<span class="tag rvd">被拉起 ×${u.revivedN}</span>`;
+    if (u.byKind.finale.n) h += `<span class="tag fin" title="${esc('全劇終：對手剩下的血量全部算給這個角色\n' + Object.entries(u.finaleBy).map(([n, v]) => `${n} ${fmt(v)}`).join('\n'))}">全劇終 +${fmt(u.byKind.finale.real)}</span>`;
+    return h;
+  }
+  function reviveList(u) {
+    const ent = Object.entries(u.revBy).sort((a, b) => b[1] - a[1]);
+    if (!ent.length) return '';
+    return `<div class="spl"><span class="k">拉起倒下的隊友：共 ${u.revN} 人次、${ent.length} 人</span>` +
+      ent.map(([n, c]) => `<div>・${esc(n)}<b>×${c}</b></div>`).join('') + `</div>`;
+  }
+
   // 簡易模式：只看名次、總計傷害（佔比）、承受、回血、爆擊率；不展開細項
   const nmTxt = u => u.full && u.full !== u.name ? `<span title="${esc(u.full)}">${esc(u.name)}</span>` : esc(u.name);
-  const simpleTags = u => (u.dead ? '<span class="tag dead">倒下</span>' : '') + (u.isAssist ? '<span class="tag ast">支援</span>' : '') + (u.isLegacy ? '<span class="tag lgc">遺志</span>' : '') + (u.isSummon ? '<span class="tag sum">分身</span>' : '');
+  const simpleTags = u => (u.dead ? '<span class="tag dead">倒下</span>' : '') + (u.isAssist ? '<span class="tag ast">支援</span>' : '') + revTags(u) + (u.isLegacy ? '<span class="tag lgc">遺志</span>' : '') + (u.isSummon ? '<span class="tag sum">分身</span>' : '');
   function sideSimple(rep, units, side, mode, mob) {
     const list = units.filter(u => u.side === side);
     if (!list.length) return '';
